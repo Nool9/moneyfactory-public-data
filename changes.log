@@ -1,0 +1,2 @@
+2026-07-11: added compressed raw 30-minute snapshots for Binance depth, all-perpetual premium index, basket open interest, global long/short ratio, taker buy/sell volume, full futures exchangeInfo, and CoinGecko top 500; all endpoints verified public and keyless, none skipped.
+2026-07-11: raw payload measured 178834 compressed bytes for 106 sources; store slot archives in daily GitHub Releases instead of Git history, while keeping a small checkpoint and append-only gap ledger on the branch.

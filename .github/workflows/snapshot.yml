@@ -11,6 +11,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: public-snapshot
+  cancel-in-progress: false
+
 jobs:
   snapshot:
     runs-on: ubuntu-latest
@@ -21,9 +25,22 @@ jobs:
           python-version: "3.12"
       - run: python -m unittest -v
       - run: python scrape.py
+      - id: raw
+        run: |
+          manifest=$(python scrape_raw.py)
+          slot=$(basename "$manifest" .json)
+          archive="raw_${slot}_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}.tar.gz"
+          tar -czf "$archive" -C raw .
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+          echo "tag=raw-${slot:0:8}" >> "$GITHUB_OUTPUT"
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "${{ steps.raw.outputs.tag }}" >/dev/null 2>&1 || gh release create "${{ steps.raw.outputs.tag }}" --title "Raw snapshots ${{ steps.raw.outputs.tag }}" --notes "Append-only compressed 30-minute raw public API snapshots."
+          gh release upload "${{ steps.raw.outputs.tag }}" "${{ steps.raw.outputs.archive }}"
       - run: |
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add snapshots current
+          git add snapshots current gaps
           git diff --cached --quiet || git commit -m "snapshot $(date -u +%Y-%m-%dT%H:%MZ)"
           git push

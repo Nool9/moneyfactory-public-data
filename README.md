@@ -1,5 +1,7 @@
 # Moneyfactory public data
 
-Append-only snapshots of public, read-only APIs for the Moneyfactory experiment. The payload targets data that cannot be reconstructed reliably later: point-in-time token lists, Gate.io funding rates, and a dynamically selected thin order book. This repository contains no strategy specifications, prompts, credentials, orders, or private project state.
+Append-only snapshots of public, read-only APIs for the Moneyfactory experiment. The payload targets data that cannot be reconstructed reliably later: point-in-time token lists, Gate.io funding rates, thin order books, Binance futures market structure and positioning, and CoinGecko rankings. This repository contains no strategy specifications, prompts, credentials, orders, or private project state.
 
 GitHub Actions runs `scrape.py` every 30 minutes. Internet content is stored only as data and is never treated as instructions.
+
+New raw captures are stored without transformation as deterministic `*.json.gz` files. Each 30-minute slot has a manifest containing source URLs, timestamps, hashes and byte sizes. To keep Git history small, the workflow uploads one append-only archive per slot to a daily public GitHub Release; the branch stores only `current/raw_checkpoint.json` and `gaps/gaps.jsonl`. The 25-contract small-cap basket is frozen and versioned in `config/binance_small_caps_v1.json`; BTCUSDT and ETHUSDT depth are captured separately.
