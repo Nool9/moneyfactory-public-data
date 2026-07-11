@@ -104,3 +104,5 @@
 {"error":"HTTP Error 451: ","gap_id":"d450fbe9858a6a1d","kind":"source_gap","slot":"2026-07-11T16:00:00Z","source":"binance_taker_volume_1000XECUSDT","url":"https://fapi.binance.com/futures/data/takerlongshortRatio?symbol=1000XECUSDT&period=30m&limit=1"}
 {"expected_sources":["coingecko_markets_001_250","coingecko_markets_251_500"],"gap_id":"f704436e9fa00364","kind":"schedule_gap","slot":"2026-07-11T17:00:00Z"}
 {"expected_sources":["coingecko_markets_001_250","coingecko_markets_251_500"],"gap_id":"3e63e303343c1290","kind":"schedule_gap","slot":"2026-07-11T18:00:00Z"}
+{"expected_sources":["coingecko_markets_001_250","coingecko_markets_251_500"],"gap_id":"6dca37a7d14f0cf3","kind":"schedule_gap","slot":"2026-07-11T19:00:00Z"}
+{"expected_sources":["coingecko_markets_001_250","coingecko_markets_251_500"],"gap_id":"8cb9fb2f2f51c61c","kind":"schedule_gap","slot":"2026-07-11T19:30:00Z"}
