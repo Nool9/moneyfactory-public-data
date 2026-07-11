@@ -32,6 +32,19 @@ class RawScrapeTest(unittest.TestCase):
             finally:
                 os.chdir(previous)
 
+    def test_github_runner_skips_binance_after_451(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}), patch.object(scrape_raw, "fetch_raw", return_value=b'[]'):
+            previous = Path.cwd()
+            try:
+                os.chdir(directory)
+                Path("config").mkdir()
+                Path("config/binance_small_caps_v1.json").write_text(json.dumps({"version": 1, "symbols": []}))
+                manifest = scrape_raw.capture(datetime(2026, 7, 11, 13, 1, tzinfo=timezone.utc))
+                payload = json.loads(manifest.read_text())
+                self.assertEqual((set(payload["sources"]), payload["skipped"]["count"]), ({"coingecko_markets_001_250", "coingecko_markets_251_500"}, 4))
+            finally:
+                os.chdir(previous)
+
 
 if __name__ == "__main__":
     unittest.main()

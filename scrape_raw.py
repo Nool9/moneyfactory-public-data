@@ -79,7 +79,13 @@ def capture(now=None, source_urls=None):
 
     basket = json.loads(BASKET.read_text(encoding="utf-8"))
     symbols = [row["symbol"] for row in basket["symbols"]]
-    source_urls = source_urls or urls(symbols)
+    skipped = None
+    if source_urls is None:
+        source_urls = urls(symbols)
+        if os.environ.get("GITHUB_ACTIONS") == "true":
+            blocked = [name for name in source_urls if name.startswith("binance_")]
+            source_urls = {name: url for name, url in source_urls.items() if name not in blocked}
+            skipped = {"count": len(blocked), "prefix": "binance_", "reason": "HTTP 451 from GitHub-hosted runner; see changes.log"}
     gaps = []
     checkpoint_path = Path("current/raw_checkpoint.json")
     if checkpoint_path.exists():
@@ -110,11 +116,12 @@ def capture(now=None, source_urls=None):
         "fetched_at": now.isoformat().replace("+00:00", "Z"),
         "basket": str(BASKET).replace("\\", "/"),
         "basket_version": basket["version"],
+        "skipped": skipped,
         "sources": records,
     }
     atomic_write(manifest_path, canonical(manifest).encode())
     ok = sum(row["status"] == "ok" for row in records.values())
-    checkpoint = {"slot": manifest["slot"], "fetched_at": manifest["fetched_at"], "sources_ok": ok, "sources_total": len(records), "gaps": len(records) - ok, "manifest_sha256": hashlib.sha256(canonical(manifest).encode()).hexdigest()}
+    checkpoint = {"slot": manifest["slot"], "fetched_at": manifest["fetched_at"], "sources_ok": ok, "sources_total": len(records), "sources_skipped": skipped["count"] if skipped else 0, "gaps": len(records) - ok, "manifest_sha256": hashlib.sha256(canonical(manifest).encode()).hexdigest()}
     atomic_write(checkpoint_path, canonical(checkpoint).encode())
     return manifest_path
 
