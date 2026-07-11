@@ -1,6 +1,9 @@
 name: public snapshots
 
 on:
+  push:
+    branches: [master]
+    paths: [.github/workflows/snapshot.yml]
   schedule:
     - cron: "*/30 * * * *"
   workflow_dispatch:
