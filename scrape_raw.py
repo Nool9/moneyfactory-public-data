@@ -69,9 +69,21 @@ def atomic_write(path, data):
     os.replace(temporary, path)
 
 
+def current_slot(now=None):
+    now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    return now.replace(minute=30 if now.minute >= 30 else 0, second=0, microsecond=0)
+
+
+def capture_due(now=None):
+    checkpoint = Path("current/raw_checkpoint.json")
+    return not checkpoint.exists() or json.loads(checkpoint.read_text(encoding="utf-8"))["slot"] != current_slot(now).isoformat().replace("+00:00", "Z")
+
+
 def capture(now=None, source_urls=None):
     now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
-    slot = now.replace(minute=30 if now.minute >= 30 else 0, second=0, microsecond=0)
+    slot = current_slot(now)
+    if not capture_due(now):
+        return None
     stamp = slot.strftime("%Y%m%dT%H%MZ")
     manifest_path = Path("raw/manifests") / slot.date().isoformat() / f"{stamp}.json"
     if manifest_path.exists():
@@ -127,4 +139,4 @@ def capture(now=None, source_urls=None):
 
 
 if __name__ == "__main__":
-    print(capture())
+    print(capture() or "SKIP")

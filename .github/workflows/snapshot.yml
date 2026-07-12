@@ -5,7 +5,7 @@ on:
     branches: [master]
     paths: [.github/workflows/snapshot.yml]
   schedule:
-    - cron: "7,37 * * * *"
+    - cron: "3,13,23,33,43,53 * * * *"
   workflow_dispatch:
 
 permissions:
@@ -24,8 +24,12 @@ jobs:
         with:
           python-version: "3.12"
       - run: python -m unittest -v
-      - run: python scrape.py
+      - id: due
+        run: echo "capture=$(python -c 'import scrape_raw; print(str(scrape_raw.capture_due()).lower())')" >> "$GITHUB_OUTPUT"
+      - if: steps.due.outputs.capture == 'true'
+        run: python scrape.py
       - id: raw
+        if: steps.due.outputs.capture == 'true'
         run: |
           manifest=$(python scrape_raw.py)
           slot=$(basename "$manifest" .json)
@@ -35,10 +39,12 @@ jobs:
           echo "tag=raw-${slot:0:8}" >> "$GITHUB_OUTPUT"
       - env:
           GH_TOKEN: ${{ github.token }}
+        if: steps.due.outputs.capture == 'true'
         run: |
           gh release view "${{ steps.raw.outputs.tag }}" >/dev/null 2>&1 || gh release create "${{ steps.raw.outputs.tag }}" --title "Raw snapshots ${{ steps.raw.outputs.tag }}" --notes "Append-only compressed 30-minute raw public API snapshots."
           gh release upload "${{ steps.raw.outputs.tag }}" "${{ steps.raw.outputs.archive }}"
-      - run: |
+      - if: steps.due.outputs.capture == 'true'
+        run: |
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
           git add snapshots current gaps

@@ -2,3 +2,4 @@
 2026-07-11: raw payload measured 178834 compressed bytes for 106 sources; store slot archives in daily GitHub Releases instead of Git history, while keeping a small checkpoint and append-only gap ledger on the branch.
 2026-07-11: GitHub Actions run 29159765165 returned HTTP 451 for all 104 Binance futures sources; skip those sources on GitHub-hosted runners and keep the failure ledger, with no proxy, key, or workaround. CoinGecko top 500 remains active; Binance capture remains available locally.
 2026-07-12: move the 30-minute GitHub schedule from overloaded :00/:30 to :07/:37 after the gap ledger recorded 22 missed slots on 2026-07-12; cadence remains 30 minutes and the existing gaps remain append-only.
+2026-07-12: :07/:37 remained unreliable (38 recorded schedule gaps); attempt cron every 10 minutes and gate captures by the persisted 30-minute checkpoint so retries cannot duplicate a slot.

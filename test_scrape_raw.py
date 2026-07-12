@@ -29,6 +29,8 @@ class RawScrapeTest(unittest.TestCase):
                 self.assertEqual(gzip.decompress(stored.read_bytes()), b'{"raw":1}')
                 self.assertFalse(Path("gaps/gaps.jsonl").exists())
                 self.assertEqual(json.loads(Path("current/raw_checkpoint.json").read_text())["sources_ok"], 2)
+                self.assertFalse(scrape_raw.capture_due(datetime(2026, 7, 11, 12, 59, tzinfo=timezone.utc)))
+                self.assertIsNone(scrape_raw.capture(datetime(2026, 7, 11, 12, 59, tzinfo=timezone.utc), sources))
             finally:
                 os.chdir(previous)
 
