@@ -145,3 +145,9 @@
 {"expected_sources":["coingecko_markets_001_250","coingecko_markets_251_500"],"gap_id":"070c71e374d98a53","kind":"schedule_gap","slot":"2026-07-12T23:00:00Z"}
 {"expected_sources":["coingecko_markets_001_250","coingecko_markets_251_500"],"gap_id":"ebcfadf66650f254","kind":"schedule_gap","slot":"2026-07-13T00:00:00Z"}
 {"expected_sources":["coingecko_markets_001_250","coingecko_markets_251_500"],"gap_id":"80e082dd6cbc4807","kind":"schedule_gap","slot":"2026-07-13T00:30:00Z"}
+{"expected_sources":["coingecko_markets_001_250","coingecko_markets_251_500"],"gap_id":"7b32faad5db590a3","kind":"schedule_gap","slot":"2026-07-13T01:30:00Z"}
+{"expected_sources":["coingecko_markets_001_250","coingecko_markets_251_500"],"gap_id":"65cabba52a40393c","kind":"schedule_gap","slot":"2026-07-13T02:00:00Z"}
+{"expected_sources":["coingecko_markets_001_250","coingecko_markets_251_500"],"gap_id":"5c1669f2cff17964","kind":"schedule_gap","slot":"2026-07-13T02:30:00Z"}
+{"expected_sources":["coingecko_markets_001_250","coingecko_markets_251_500"],"gap_id":"e16a20f03042489c","kind":"schedule_gap","slot":"2026-07-13T03:00:00Z"}
+{"expected_sources":["coingecko_markets_001_250","coingecko_markets_251_500"],"gap_id":"cd30695c997a7d21","kind":"schedule_gap","slot":"2026-07-13T03:30:00Z"}
+{"expected_sources":["coingecko_markets_001_250","coingecko_markets_251_500"],"gap_id":"bedb1370c5324a2f","kind":"schedule_gap","slot":"2026-07-13T04:00:00Z"}
