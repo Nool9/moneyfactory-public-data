@@ -1,3 +1,4 @@
 __pycache__/
+.wrangler/
 raw/
 raw_*.tar.gz

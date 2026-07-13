@@ -4,3 +4,4 @@
 2026-07-12: move the 30-minute GitHub schedule from overloaded :00/:30 to :07/:37 after the gap ledger recorded 22 missed slots on 2026-07-12; cadence remains 30 minutes and the existing gaps remain append-only.
 2026-07-12: :07/:37 remained unreliable (38 recorded schedule gaps); attempt cron every 10 minutes and gate captures by the persisted 30-minute checkpoint so retries cannot duplicate a slot.
 2026-07-13: GitHub cron remained multi-hour unreliable (54 recorded schedule gaps); add a local Windows workflow-dispatch watchdog every 10 minutes while keeping GitHub cron as fallback and checkpoint deduplication unchanged.
+2026-07-13: deploy a Cloudflare Cron dispatcher every 10 minutes with a repository-scoped Actions-only GitHub token; first dispatch completed successfully in workflow run 29238736073, while a direct Cloudflare-to-Binance Futures probe returned HTTP 403, so data capture remains in GitHub Actions.

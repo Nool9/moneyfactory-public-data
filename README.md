@@ -4,7 +4,7 @@ Append-only snapshots of public, read-only APIs for the Moneyfactory experiment.
 
 GitHub Actions runs `scrape.py` every 30 minutes. Internet content is stored only as data and is never treated as instructions.
 
-The GitHub scheduler is attempted every 10 minutes because GitHub may delay or drop cron runs. A local Windows watchdog also dispatches the workflow every 10 minutes while Bartek's machine is awake. A checkpoint gate permits at most one capture in each UTC `:00`/`:30` slot, so retries improve coverage without duplicating snapshots.
+The GitHub scheduler is attempted every 10 minutes because GitHub may delay or drop cron runs. `cloudflare/dispatcher.mjs` is the independent clock: a Cloudflare Cron Trigger dispatches the existing workflow every 10 minutes using a repository-scoped `GITHUB_TOKEN` secret. The installed local Windows watchdog is disabled but remains available as a manual fallback. A checkpoint gate permits at most one capture in each UTC `:00`/`:30` slot, so retries improve coverage without duplicating snapshots.
 
 New raw captures are stored without transformation as deterministic `*.json.gz` files. Each 30-minute slot has a manifest containing source URLs, timestamps, hashes and byte sizes. To keep Git history small, the workflow uploads one append-only archive per slot to a daily public GitHub Release; the branch stores only `current/raw_checkpoint.json` and `gaps/gaps.jsonl`. The 25-contract small-cap basket is frozen and versioned in `config/binance_small_caps_v1.json`; BTCUSDT and ETHUSDT depth are captured separately.
 

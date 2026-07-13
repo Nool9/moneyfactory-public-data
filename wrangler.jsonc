@@ -1,0 +1,8 @@
+{
+  "name": "moneyfactory-snapshot-dispatcher",
+  "main": "cloudflare/dispatcher.mjs",
+  "compatibility_date": "2026-07-13",
+  "workers_dev": false,
+  "triggers": { "crons": ["*/10 * * * *"] },
+  "observability": { "enabled": true }
+}
