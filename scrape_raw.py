@@ -10,7 +10,7 @@ from pathlib import Path
 
 BINANCE = "https://fapi.binance.com"
 COINGECKO = "https://api.coingecko.com/api/v3/coins/markets"
-BASKET = Path("config/binance_small_caps_v1.json")
+BASKET = Path("config/binance_small_caps_v2.json")
 
 
 def fetch_raw(url):

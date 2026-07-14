@@ -14,7 +14,7 @@ class RawScrapeTest(unittest.TestCase):
     def test_versioned_basket_and_raw_gzip_capture(self):
         basket = json.loads(scrape_raw.BASKET.read_text(encoding="utf-8"))
         symbols = [row["symbol"] for row in basket["symbols"]]
-        self.assertEqual((basket["version"], len(symbols), len(scrape_raw.urls(symbols))), (1, 25, 106))
+        self.assertEqual((basket["version"], len(symbols), len(scrape_raw.urls(symbols))), (2, 25, 106))
 
         sources = {"one": "https://example.test/one", "two": "https://example.test/two"}
         with tempfile.TemporaryDirectory() as directory, patch.object(scrape_raw, "fetch_raw", side_effect=[b'{"raw":1}', b'[1,2]']):
@@ -22,7 +22,7 @@ class RawScrapeTest(unittest.TestCase):
             try:
                 os.chdir(directory)
                 Path("config").mkdir()
-                Path("config/binance_small_caps_v1.json").write_text(json.dumps({"version": 1, "symbols": []}))
+                Path("config/binance_small_caps_v2.json").write_text(json.dumps({"version": 2, "symbols": []}))
                 manifest = scrape_raw.capture(datetime(2026, 7, 11, 12, 42, tzinfo=timezone.utc), sources)
                 payload = json.loads(manifest.read_text())
                 stored = Path(payload["sources"]["one"]["path"])
@@ -40,7 +40,7 @@ class RawScrapeTest(unittest.TestCase):
             try:
                 os.chdir(directory)
                 Path("config").mkdir()
-                Path("config/binance_small_caps_v1.json").write_text(json.dumps({"version": 1, "symbols": []}))
+                Path("config/binance_small_caps_v2.json").write_text(json.dumps({"version": 2, "symbols": []}))
                 manifest = scrape_raw.capture(datetime(2026, 7, 11, 13, 1, tzinfo=timezone.utc))
                 payload = json.loads(manifest.read_text())
                 self.assertEqual((set(payload["sources"]), payload["skipped"]["count"]), ({"coingecko_markets_001_250", "coingecko_markets_251_500"}, 4))

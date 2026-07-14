@@ -1,0 +1,41 @@
+{
+  "version": 2,
+  "selected_at": "2026-07-14T20:36:06Z",
+  "source": "https://fapi.binance.com/fapi/v1/ticker/24hr + /fapi/v1/depth",
+  "universe": "active USDT perpetuals",
+  "method": "v1 survivors plus lowest-volume replacements passing the measurable depth rules",
+  "audit_basis": {
+    "reference_child_notional_usd": "64.238",
+    "reference_parent_notional_usd": "64.238",
+    "minimum_depth_0.1pct_min_side_usd": "642.38",
+    "minimum_depth_1pct_min_side_usd": "192.714",
+    "unmeasured": ["7-30d spread percentiles", "multi-day volume-to-depth", "top-2 venue concentration", "multi-day Benford", "empty 1m candles"]
+  },
+  "symbols": [
+    {"rank_from_lowest": 6, "symbol": "CVCUSDT", "quoteVolume": "378488.4373000"},
+    {"rank_from_lowest": 21, "symbol": "ARKUSDT", "quoteVolume": "521238.1734000"},
+    {"rank_from_lowest": 27, "symbol": "POLYXUSDT", "quoteVolume": "550937.3550100"},
+    {"rank_from_lowest": 42, "symbol": "MEWUSDT", "quoteVolume": "607483.3496650"},
+    {"rank_from_lowest": 47, "symbol": "BEAMXUSDT", "quoteVolume": "616677.7811810", "replaces": "INITUSDT"},
+    {"rank_from_lowest": 50, "symbol": "MELANIAUSDT", "quoteVolume": "624981.724005", "replaces": "ORDERUSDT"},
+    {"rank_from_lowest": 58, "symbol": "ANIMEUSDT", "quoteVolume": "679402.3530050", "replaces": "SCRUSDT"},
+    {"rank_from_lowest": 67, "symbol": "CETUSUSDT", "quoteVolume": "725663.6725600"},
+    {"rank_from_lowest": 70, "symbol": "KAIAUSDT", "quoteVolume": "737664.0341300", "replaces": "1000CATUSDT"},
+    {"rank_from_lowest": 80, "symbol": "LQTYUSDT", "quoteVolume": "778571.726340"},
+    {"rank_from_lowest": 81, "symbol": "CTSIUSDT", "quoteVolume": "779878.2011700", "replaces": "USTCUSDT"},
+    {"rank_from_lowest": 84, "symbol": "SUPERUSDT", "quoteVolume": "806089.1136000", "replaces": "MTLUSDT"},
+    {"rank_from_lowest": 85, "symbol": "QTUMUSDT", "quoteVolume": "806963.215590", "replaces": "ILVUSDT"},
+    {"rank_from_lowest": 88, "symbol": "FORMUSDT", "quoteVolume": "837264.876190", "replaces": "SQDUSDT"},
+    {"rank_from_lowest": 89, "symbol": "NXPCUSDT", "quoteVolume": "843303.3886000", "replaces": "ARIAUSDT"},
+    {"rank_from_lowest": 90, "symbol": "MAGICUSDT", "quoteVolume": "844206.426184", "replaces": "1000000MOGUSDT"},
+    {"rank_from_lowest": 92, "symbol": "RAREUSDT", "quoteVolume": "846053.9859400", "replaces": "FLOWUSDT"},
+    {"rank_from_lowest": 95, "symbol": "XVGUSDT", "quoteVolume": "852915.9299690", "replaces": "STBLUSDT"},
+    {"rank_from_lowest": 98, "symbol": "POWRUSDT", "quoteVolume": "864333.2588300", "replaces": "BTRUSDT"},
+    {"rank_from_lowest": 104, "symbol": "UMAUSDT", "quoteVolume": "872348.466800", "replaces": "ALPINEUSDT"},
+    {"rank_from_lowest": 107, "symbol": "GASUSDT", "quoteVolume": "883786.410500", "replaces": "CVXUSDT"},
+    {"rank_from_lowest": 112, "symbol": "SSVUSDT", "quoteVolume": "899746.130550", "replaces": "ALCHUSDT"},
+    {"rank_from_lowest": 232, "symbol": "TWTUSDT", "quoteVolume": "1776832.708000"},
+    {"rank_from_lowest": 326, "symbol": "ZKCUSDT", "quoteVolume": "3299693.7398100"},
+    {"rank_from_lowest": 505, "symbol": "1000XECUSDT", "quoteVolume": "88985347.2746650"}
+  ]
+}
