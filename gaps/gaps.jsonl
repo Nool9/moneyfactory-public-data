@@ -156,3 +156,5 @@
 {"expected_sources":["coingecko_markets_001_250","coingecko_markets_251_500"],"gap_id":"b3627b06469db5f3","kind":"schedule_gap","slot":"2026-07-13T06:00:00Z"}
 {"expected_sources":["coingecko_markets_001_250","coingecko_markets_251_500"],"gap_id":"90e9fa4619fe4455","kind":"schedule_gap","slot":"2026-07-13T06:30:00Z"}
 {"expected_sources":["coingecko_markets_001_250","coingecko_markets_251_500"],"gap_id":"5f313f815d0a5758","kind":"schedule_gap","slot":"2026-07-13T07:00:00Z"}
+{"expected_sources":["coingecko_markets_001_250","coingecko_markets_251_500"],"gap_id":"a3970e1c97888b7e","kind":"schedule_gap","slot":"2026-07-16T22:30:00Z"}
+{"expected_sources":["coingecko_markets_001_250","coingecko_markets_251_500"],"gap_id":"9874e1d083c39597","kind":"schedule_gap","slot":"2026-07-16T23:00:00Z"}
