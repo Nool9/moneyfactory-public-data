@@ -159,3 +159,4 @@
 {"expected_sources":["coingecko_markets_001_250","coingecko_markets_251_500"],"gap_id":"a3970e1c97888b7e","kind":"schedule_gap","slot":"2026-07-16T22:30:00Z"}
 {"expected_sources":["coingecko_markets_001_250","coingecko_markets_251_500"],"gap_id":"9874e1d083c39597","kind":"schedule_gap","slot":"2026-07-16T23:00:00Z"}
 {"error":"HTTP Error 403: Forbidden","gap_id":"b2a06a5cc44735e6","kind":"source_gap","slot":"2026-07-17T11:00:00Z","source":"announcements_bybit","url":"https://api.bybit.com/v5/announcements/index?locale=en-US&type=new_crypto&limit=20"}
+{"error":"HTTP Error 403: Forbidden","gap_id":"fa13141e5fb7f61d","kind":"source_gap","slot":"2026-07-17T11:30:00Z","source":"announcements_bybit","url":"https://api.bybit.com/v5/announcements/index?locale=en-US&type=new_crypto&limit=20"}
