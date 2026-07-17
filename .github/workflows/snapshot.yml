@@ -43,7 +43,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         if: steps.due.outputs.capture == 'true'
         run: |
-          gh release view "${{ steps.raw.outputs.tag }}" >/dev/null 2>&1 || gh release create "${{ steps.raw.outputs.tag }}" --title "Raw snapshots ${{ steps.raw.outputs.tag }}" --notes "Append-only compressed 30-minute raw public API snapshots."
+          gh release view "${{ steps.raw.outputs.tag }}" >/dev/null 2>&1 || gh release create "${{ steps.raw.outputs.tag }}" --title "Raw snapshots ${{ steps.raw.outputs.tag }}" --notes "Append-only compressed 30-minute raw public API snapshots." || true
           gh release upload "${{ steps.raw.outputs.tag }}" "${{ steps.raw.outputs.archive }}"
       - if: steps.due.outputs.capture == 'true'
         run: |
