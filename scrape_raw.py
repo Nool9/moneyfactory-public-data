@@ -11,16 +11,24 @@ from pathlib import Path
 BINANCE = "https://fapi.binance.com"
 COINGECKO = "https://api.coingecko.com/api/v3/coins/markets"
 BASKET = Path("config/binance_small_caps_v2.json")
+ANNOUNCEMENTS = {
+    "announcements_binance_cms": "https://www.binance.com/bapi/composite/v1/public/cms/article/list/query?type=1&catalogId=48&pageNo=1&pageSize=50",
+    "announcements_kucoin": "https://api.kucoin.com/api/v3/announcements?currentPage=1&pageSize=50&annType=new-listings&lang=en_US",
+    "announcements_okx": "https://www.okx.com/help/section/announcements-new-listings",
+    "announcements_bybit": "https://api.bybit.com/v5/announcements/index?locale=en-US&type=new_crypto&limit=20",
+}
+HTML_SOURCES = {"announcements_okx"}
 
 
-def fetch_raw(url):
+def fetch_raw(url, expect_json=True):
     request = urllib.request.Request(url, headers={"User-Agent": "Moneyfactory-Public-Scraper/3", "Accept": "application/json"})
     error = None
     for attempt in range(3):
         try:
             with urllib.request.urlopen(request, timeout=30) as response:
                 raw = response.read()
-            json.loads(raw)
+            if expect_json:
+                json.loads(raw)
             return raw
         except Exception as caught:
             error = caught
@@ -31,6 +39,7 @@ def fetch_raw(url):
 
 def urls(symbols):
     result = {
+        **ANNOUNCEMENTS,
         "binance_futures_exchange_info": f"{BINANCE}/fapi/v1/exchangeInfo",
         "binance_futures_premium_index": f"{BINANCE}/fapi/v1/premiumIndex",
         "coingecko_markets_001_250": COINGECKO + "?" + urllib.parse.urlencode({"vs_currency": "usd", "order": "market_cap_desc", "per_page": 250, "page": 1, "sparkline": "false"}),
@@ -112,11 +121,11 @@ def capture(now=None, source_urls=None):
     directory = Path("raw/data") / slot.date().isoformat() / stamp
     for name, url in source_urls.items():
         try:
-            raw = fetch_raw(url)
-            path = directory / f"{name}.json.gz"
+            raw = fetch_raw(url, expect_json=name not in HTML_SOURCES)
+            path = directory / f"{name}.{'html' if name in HTML_SOURCES else 'json'}.gz"
             compressed = gzip.compress(raw, compresslevel=9, mtime=0)
             atomic_write(path, compressed)
-            records[name] = {"status": "ok", "url": url, "path": path.as_posix(), "sha256": hashlib.sha256(raw).hexdigest(), "raw_bytes": len(raw), "gzip_bytes": len(compressed)}
+            records[name] = {"status": "ok", "url": url, "first_seen": now.isoformat().replace("+00:00", "Z"), "path": path.as_posix(), "sha256": hashlib.sha256(raw).hexdigest(), "raw_bytes": len(raw), "gzip_bytes": len(compressed)}
         except Exception as error:
             gap_id = hashlib.sha256(f"source:{slot.isoformat()}:{name}".encode()).hexdigest()[:16]
             gaps.append({"gap_id": gap_id, "kind": "source_gap", "slot": slot.isoformat().replace("+00:00", "Z"), "source": name, "url": url, "error": str(error)})
