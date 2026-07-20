@@ -44,6 +44,8 @@ def urls(symbols):
         "binance_futures_premium_index": f"{BINANCE}/fapi/v1/premiumIndex",
         "coingecko_markets_001_250": COINGECKO + "?" + urllib.parse.urlencode({"vs_currency": "usd", "order": "market_cap_desc", "per_page": 250, "page": 1, "sparkline": "false"}),
         "coingecko_markets_251_500": COINGECKO + "?" + urllib.parse.urlencode({"vs_currency": "usd", "order": "market_cap_desc", "per_page": 250, "page": 2, "sparkline": "false"}),
+        "coingecko_volume_001_250": COINGECKO + "?" + urllib.parse.urlencode({"vs_currency": "usd", "order": "volume_desc", "per_page": 250, "page": 1, "sparkline": "false"}),
+        "coingecko_volume_251_500": COINGECKO + "?" + urllib.parse.urlencode({"vs_currency": "usd", "order": "volume_desc", "per_page": 250, "page": 2, "sparkline": "false"}),
     }
     for symbol in ["BTCUSDT", "ETHUSDT", *symbols]:
         result[f"binance_depth_{symbol}"] = f"{BINANCE}/fapi/v1/depth?" + urllib.parse.urlencode({"symbol": symbol, "limit": 50})
