@@ -45,7 +45,6 @@ def urls(symbols):
         "coingecko_markets_001_250": COINGECKO + "?" + urllib.parse.urlencode({"vs_currency": "usd", "order": "market_cap_desc", "per_page": 250, "page": 1, "sparkline": "false"}),
         "coingecko_markets_251_500": COINGECKO + "?" + urllib.parse.urlencode({"vs_currency": "usd", "order": "market_cap_desc", "per_page": 250, "page": 2, "sparkline": "false"}),
         "coingecko_volume_001_250": COINGECKO + "?" + urllib.parse.urlencode({"vs_currency": "usd", "order": "volume_desc", "per_page": 250, "page": 1, "sparkline": "false"}),
-        "coingecko_volume_251_500": COINGECKO + "?" + urllib.parse.urlencode({"vs_currency": "usd", "order": "volume_desc", "per_page": 250, "page": 2, "sparkline": "false"}),
     }
     for symbol in ["BTCUSDT", "ETHUSDT", *symbols]:
         result[f"binance_depth_{symbol}"] = f"{BINANCE}/fapi/v1/depth?" + urllib.parse.urlencode({"symbol": symbol, "limit": 50})
@@ -123,7 +122,7 @@ def capture(now=None, source_urls=None):
     directory = Path("raw/data") / slot.date().isoformat() / stamp
     for name, url in source_urls.items():
         try:
-            raw = fetch_raw(url, expect_json=name not in HTML_SOURCES)
+            raw = fetch_raw(url, expect_json=name not in HTML_SOURCES and name != "coingecko_volume_001_250")
             path = directory / f"{name}.{'html' if name in HTML_SOURCES else 'json'}.gz"
             compressed = gzip.compress(raw, compresslevel=9, mtime=0)
             atomic_write(path, compressed)

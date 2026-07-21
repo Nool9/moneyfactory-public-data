@@ -15,15 +15,13 @@ class RawScrapeTest(unittest.TestCase):
         basket = json.loads(scrape_raw.BASKET.read_text(encoding="utf-8"))
         symbols = [row["symbol"] for row in basket["symbols"]]
         source_urls = scrape_raw.urls(symbols)
-        self.assertEqual((basket["version"], len(symbols), len(source_urls)), (2, 25, 112))
+        self.assertEqual((basket["version"], len(symbols), len(source_urls)), (2, 25, 111))
         self.assertEqual(set(scrape_raw.ANNOUNCEMENTS), {"announcements_binance_cms", "announcements_kucoin", "announcements_okx", "announcements_bybit"})
         self.assertEqual(
-            {name: source_urls[name] for name in ("coingecko_volume_001_250", "coingecko_volume_251_500")},
-            {
-                "coingecko_volume_001_250": "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=250&page=1&sparkline=false",
-                "coingecko_volume_251_500": "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=250&page=2&sparkline=false",
-            },
+            source_urls["coingecko_volume_001_250"],
+            "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=250&page=1&sparkline=false",
         )
+        self.assertNotIn("coingecko_volume_251_500", source_urls)
 
         sources = {"one": "https://example.test/one", "two": "https://example.test/two"}
         with tempfile.TemporaryDirectory() as directory, patch.object(scrape_raw, "fetch_raw", side_effect=[b'{"raw":1}', b'[1,2]']):
@@ -53,7 +51,30 @@ class RawScrapeTest(unittest.TestCase):
                 Path("config/binance_small_caps_v2.json").write_text(json.dumps({"version": 2, "symbols": []}))
                 manifest = scrape_raw.capture(datetime(2026, 7, 11, 13, 1, tzinfo=timezone.utc))
                 payload = json.loads(manifest.read_text())
-                self.assertEqual((set(payload["sources"]), payload["skipped"]["count"]), (set(scrape_raw.ANNOUNCEMENTS) | {"coingecko_markets_001_250", "coingecko_markets_251_500", "coingecko_volume_001_250", "coingecko_volume_251_500"}, 4))
+                self.assertEqual((set(payload["sources"]), payload["skipped"]["count"]), (set(scrape_raw.ANNOUNCEMENTS) | {"coingecko_markets_001_250", "coingecko_markets_251_500", "coingecko_volume_001_250"}, 4))
+            finally:
+                os.chdir(previous)
+
+    def test_top250_content_is_captured_once_without_content_retry(self):
+        response = MagicMock()
+        response.read.return_value = b"not-json"
+        response.__enter__.return_value = response
+        source_urls = {
+            "coingecko_volume_001_250": "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=250&page=1&sparkline=false"
+        }
+        with tempfile.TemporaryDirectory() as directory, patch.object(scrape_raw.urllib.request, "urlopen", return_value=response) as urlopen, patch.object(scrape_raw.time, "sleep"):
+            previous = Path.cwd()
+            try:
+                os.chdir(directory)
+                Path("config").mkdir()
+                Path("config/binance_small_caps_v2.json").write_text(json.dumps({"version": 2, "symbols": []}))
+                manifest = scrape_raw.capture(datetime(2026, 7, 21, 21, 1, tzinfo=timezone.utc), source_urls)
+                payload = json.loads(manifest.read_text())
+                self.assertEqual(urlopen.call_count, 1)
+                self.assertEqual(payload["sources"]["coingecko_volume_001_250"]["status"], "ok")
+                stored = Path(payload["sources"]["coingecko_volume_001_250"]["path"])
+                self.assertEqual(gzip.decompress(stored.read_bytes()), b"not-json")
+                self.assertFalse(Path("gaps/gaps.jsonl").exists())
             finally:
                 os.chdir(previous)
 
