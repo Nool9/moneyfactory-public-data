@@ -1,0 +1,34 @@
+name: PIT ledger v1
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0,30 * * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pit-ledger-BASKET_PIT_LEDGER_TOP250_BINANCE_BYBIT_V1
+  cancel-in-progress: false
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Fail-closed capture wrapper
+        env:
+          BINANCE_MARKET_DATA_API_KEY: ${{ secrets.BINANCE_MARKET_DATA_API_KEY }}
+          PIT_ACTIVATION_APPROVED: ${{ vars.PIT_ACTIVATION_APPROVED }}
+          PIT_AUTHORIZED_WRITER: ${{ vars.PIT_AUTHORIZED_WRITER }}
+          PIT_H0: ${{ vars.PIT_H0 }}
+          PIT_I_IMPL: ${{ vars.PIT_I_IMPL }}
+          PIT_I_IMPL_CURRENT: ${{ vars.PIT_I_IMPL_CURRENT }}
+          PIT_KEY_PERMISSION_PROOF: ${{ vars.PIT_KEY_PERMISSION_PROOF }}
+          PIT_SECRET_APPROVED: ${{ vars.PIT_SECRET_APPROVED }}
+          PIT_TARGET_WRITE_APPROVED: ${{ vars.PIT_TARGET_WRITE_APPROVED }}
+        run: python pit_ledger.py workflow
