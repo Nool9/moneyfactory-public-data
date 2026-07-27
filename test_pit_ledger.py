@@ -42,6 +42,46 @@ def bybit_instrument(base="BTC"):
     }
 
 
+def complete_snapshot_fixture(bybit_page_count=1):
+    writer, slot = "writer", "2026-07-26T20:00:00.000Z"
+    ledger = p.Ledger(writer)
+    claim = p.make_claim(slot, "A" * 64, writer, ledger.head)
+    ledger.claim(claim, writer, ledger.head)
+    bodies = {
+        "CG_TOP250": universe(), "BN_FUT_EXCHANGE_INFO": b'{"symbols":[]}',
+        "BN_FUT_PREMIUM_INDEX": b"[]", "BN_FUT_BOOK_TICKER": b"[]",
+        "BN_MARGIN_ASSETS": b"[]", "BN_MARGIN_PAIRS": b"[]",
+        "BY_LINEAR_TICKERS": b'{"result":{"list":[]},"time":1720000000123}',
+        "BY_SPOT_INSTRUMENTS": b'{"result":{"list":[]}}',
+        "BY_MARGIN_BORROWABLE": b'{"result":{"list":[]}}',
+    }
+    bybit_pages = [
+        b'{"result":{"list":[],"nextPageCursor":"next"}}',
+        b'{"result":{"list":[],"nextPageCursor":""}}',
+    ] if bybit_page_count == 2 else [b'{"result":{"list":[],"nextPageCursor":""}}']
+
+    def fetch(source_id, url):
+        if source_id == "BY_LINEAR_INSTRUMENTS":
+            return 200, bybit_pages[1 if "&cursor=" in url else 0], {}
+        return 200, bodies[source_id], {}
+
+    parsed = p.acquire_fixture_sources(ledger, claim, fetch)
+    snapshot = p.build_snapshot(bodies["CG_TOP250"], parsed, claim)
+    manifests = parsed["__source_manifests__"]
+    manifest_map = {
+        p.slot_artifact(
+            slot, "source-manifests", item["source_id"] + "-" + str(item["page_ordinal"]) + ".json"
+        ): item
+        for item in manifests
+    }
+    context = p.GitContext(
+        "H0", "HEAD", claim["value"]["idempotency_key"], claim["value"],
+        p.canonical_bytes(claim["value"]), dict(ledger.raw[claim["value"]["idempotency_key"]]),
+        manifest_map, p.run_log_bytes(claim), 0, True,
+    )
+    return claim, manifests, snapshot, context
+
+
 class CanonicalTests(unittest.TestCase):
     def test_global_json_jsonl_and_artifact_type_oracles(self):
         fixtures = {
@@ -563,24 +603,10 @@ class PermissionAndStaticTests(unittest.TestCase):
         self.assertEqual(result["__outcome__"]["outcome_kind"], "SNAPSHOT_PARTIAL")
 
     def test_snapshot_semantic_witness_and_contextual_provenance(self):
-        writer, slot = "writer", "2026-07-26T20:00:00.000Z"
-        ledger = p.Ledger(writer)
-        claim = p.make_claim(slot, "A" * 64, writer, ledger.head)
-        ledger.claim(claim, writer, ledger.head)
-        bodies = {
-            "CG_TOP250": universe(), "BN_FUT_EXCHANGE_INFO": b'{"symbols":[]}',
-            "BN_FUT_PREMIUM_INDEX": b"[]", "BN_FUT_BOOK_TICKER": b"[]",
-            "BN_MARGIN_ASSETS": b"[]", "BN_MARGIN_PAIRS": b"[]",
-            "BY_LINEAR_INSTRUMENTS": b'{"result":{"list":[],"nextPageCursor":""}}',
-            "BY_LINEAR_TICKERS": b'{"result":{"list":[]},"time":1720000000123}',
-            "BY_SPOT_INSTRUMENTS": b'{"result":{"list":[]}}',
-            "BY_MARGIN_BORROWABLE": b'{"result":{"list":[]}}',
-        }
-        parsed = p.acquire_fixture_sources(ledger, claim, lambda source, _: (200, bodies[source], {}))
-        snapshot = p.build_snapshot(bodies["CG_TOP250"], parsed, claim)
-        p.validate_snapshot(snapshot, claim, parsed["__source_manifests__"])
+        claim, manifests, snapshot, context = complete_snapshot_fixture()
+        p.validate_snapshot(snapshot, claim, manifests, context, False, "A" * 64)
         with self.assertRaises(p.PitError):
-            p.validate_snapshot(snapshot, claim, parsed["__source_manifests__"], {"writer_stop": False, "outcome_count": 1, "claim_before_request": True})
+            p.validate_snapshot(snapshot, claim, manifests, {"writer_stop": False}, False, "A" * 64)
         broken = json.loads(json.dumps(snapshot))
         row = broken["assets"][0]["venues"][0]
         row.update(
@@ -597,7 +623,90 @@ class PermissionAndStaticTests(unittest.TestCase):
             for venue in asset["venues"]:
                 venue["source_raw_sha256s"] = []
         with self.assertRaises(p.PitError):
-            p.validate_snapshot(empty, claim, parsed["__source_manifests__"])
+            p.validate_snapshot(empty, claim, manifests, context, False, "A" * 64)
+
+    def test_missing_any_source_or_page_rejected(self):
+        claim, manifests, snapshot, context = complete_snapshot_fixture(2)
+        missing_source = [item for item in manifests if item["source_id"] != "BN_MARGIN_PAIRS"]
+        source_context = p.GitContext(
+            context.h0, context.head, context.key, context.claim, context.claim_bytes,
+            {path: raw for path, raw in context.raw.items() if "BN_MARGIN_PAIRS" not in path},
+            {path: item for path, item in context.source_manifests.items() if item["source_id"] != "BN_MARGIN_PAIRS"},
+            context.log, context.outcome_count, context.claim_before_raw,
+        )
+        with self.assertRaises(p.PitError):
+            p.validate_snapshot(snapshot, claim, missing_source, source_context, False, "A" * 64)
+        missing_page = [
+            item for item in manifests
+            if not (item["source_id"] == "BY_LINEAR_INSTRUMENTS" and item["page_ordinal"] == 1)
+        ]
+        page_context = p.GitContext(
+            context.h0, context.head, context.key, context.claim, context.claim_bytes,
+            {path: raw for path, raw in context.raw.items() if "BY_LINEAR_INSTRUMENTS-1" not in path},
+            {
+                path: item for path, item in context.source_manifests.items()
+                if not (item["source_id"] == "BY_LINEAR_INSTRUMENTS" and item["page_ordinal"] == 1)
+            },
+            context.log, context.outcome_count, context.claim_before_raw,
+        )
+        with self.assertRaises(p.PitError):
+            p.validate_snapshot(snapshot, claim, missing_page, page_context, False, "A" * 64)
+
+    def test_raw_rederivation_mismatch_rejected(self):
+        claim, manifests, snapshot, context = complete_snapshot_fixture()
+        changed = json.loads(json.dumps(snapshot))
+        manifests = [dict(item) for item in manifests]
+        target = next(item for item in manifests if item["source_id"] == "BN_FUT_EXCHANGE_INFO")
+        old_hash = target["raw_sha256"]
+        raw = json.dumps({"symbols": [binance_instrument("X0")]}, separators=(",", ":")).encode()
+        target.update(raw_bytes=len(raw), raw_sha256=p.sha256(raw))
+        changed["available_raw_sha256s"] = sorted(
+            p.sha256(raw) if item == old_hash else item for item in changed["available_raw_sha256s"]
+        )
+        changed["source_manifest_sha256s"] = sorted({p.sha256(p.canonical_bytes(item)) for item in manifests})
+        for asset in changed["assets"]:
+            venue = asset["venues"][0]
+            venue["source_raw_sha256s"] = sorted(
+                p.sha256(raw) if item == old_hash else item for item in venue["source_raw_sha256s"]
+            )
+        raw_context = dict(context.raw)
+        raw_context[target["raw_relative_path"]] = raw
+        manifest_context = {
+            path: next(
+                item for item in manifests
+                if (item["source_id"], item["page_ordinal"]) == (original["source_id"], original["page_ordinal"])
+            )
+            for path, original in context.source_manifests.items()
+        }
+        changed_context = p.GitContext(
+            context.h0, context.head, context.key, context.claim, context.claim_bytes,
+            raw_context, manifest_context, context.log, context.outcome_count, context.claim_before_raw,
+        )
+        with self.assertRaisesRegex(p.PitError, "RAW_REDERIVATION_MISMATCH"):
+            p.validate_snapshot(changed, claim, manifests, changed_context, False, "A" * 64)
+
+    def test_delayed_start_recovers_overdue_before_window_stop(self):
+        class CalendarWriter:
+            def __init__(self):
+                self.recovered = []
+
+            def remote_head(self):
+                return "HEAD"
+
+            def ledger_records(self, _):
+                return []
+
+            def recover_slot(self, _, claim, __, expected_i_impl):
+                self.recovered.append((claim["value"]["formal_slot_utc"], expected_i_impl))
+                return "PUBLISHED", "NEXT"
+
+        writer = CalendarWriter()
+        with self.assertRaisesRegex(p.PitError, "ACQUISITION_WINDOW_CLOSED"):
+            p.prepare_live_slot(
+                writer, "H0", "2026-07-26T19:30:00.000Z", "2026-07-26T20:00:00.000Z",
+                datetime(2026, 7, 26, 20, 12, tzinfo=timezone.utc), "A" * 64, "writer",
+            )
+        self.assertEqual(writer.recovered, [("2026-07-26T19:30:00.000Z", "A" * 64)])
 
     def test_schedule_and_branch_writer_are_frozen(self):
         workflow = (Path(__file__).parent / ".github/workflows/pit-ledger.yml").read_text()
@@ -611,7 +720,7 @@ class PermissionAndStaticTests(unittest.TestCase):
             with self.assertRaises(p.PitError):
                 p.acquisition_window("2026-07-26T20:00:00.000Z", now)
 
-    def test_real_local_bare_remote_e2e(self):
+    def test_pinned_i_impl_and_atomic_terminal_crash_oracles_real_local_bare_remote(self):
         p.e2e_self_check()
 
     def test_self_check_subprocess_offline(self):

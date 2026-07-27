@@ -16,7 +16,10 @@ checks out and writes only `pit-ledger-v1` and fails closed
 before network access unless every separately governed activation, target-write,
 secret, writer, implementation, epoch and permission boundary is present.
 Each slot has an immutable namespace, real log/slot manifest, checkpoint and
-continuous append-only ledger index; overdue slots are recovered before capture.
+continuous append-only ledger index. The outcome, slot manifest, index record
+and checkpoint share one atomic terminal commit; duplicate acceptance replays
+all ten sources and every Bybit page from raw bytes against the pinned
+implementation, and overdue recovery precedes the current-window gate.
 
 This child commit is not an activation: no live download, collector-v4 read,
 target mutation, remote branch, push, dispatch, `H0`, `S0`, killtest or trading

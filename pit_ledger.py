@@ -747,11 +747,14 @@ def validate_snapshot(
     source_manifests: list[dict[str, Any]] | None = None,
     history: GitContext | None = None,
     require_context: bool = False,
+    expected_i_impl: str | None = None,
 ) -> None:
     validate_normative(snapshot)
     if snapshot.get("contract_id") != CONTRACT_ID or snapshot.get("epoch_id") != EPOCH_ID:
         raise PitError("IDENTITY_MISMATCH")
     if not SHA256_RE.fullmatch(snapshot.get("I_impl", "")):
+        raise PitError("IMPLEMENTATION_MISMATCH")
+    if expected_i_impl is not None and snapshot["I_impl"] != expected_i_impl:
         raise PitError("IMPLEMENTATION_MISMATCH")
     slot = snapshot.get("formal_slot_utc")
     if snapshot.get("idempotency_key") != EPOCH_ID + "|" + str(slot):
@@ -852,7 +855,7 @@ def validate_snapshot(
     raw_hashes = snapshot.get("available_raw_sha256s")
     if snapshot.get("available_raw_count") != len(raw_paths or []) or not isinstance(raw_hashes, list):
         raise PitError("RAW_PROVENANCE")
-    if require_context and (claim is None or source_manifests is None or history is None):
+    if require_context and (claim is None or source_manifests is None or history is None or expected_i_impl is None):
         raise PitError("CONTEXT_REQUIRED")
     if history is not None and not isinstance(history, GitContext):
         raise PitError("HISTORY_PROVENANCE")
@@ -912,6 +915,117 @@ def validate_snapshot(
             sha256(canonical_bytes(item)) for item in source_manifests
         ):
             raise PitError("SOURCE_PROVENANCE")
+    if source_manifests is not None or history is not None:
+        if claim is None or source_manifests is None or history is None or expected_i_impl is None:
+            raise PitError("CONTEXT_REQUIRED")
+        raw_universe, sources = reconstruct_snapshot_sources(claim, source_manifests, history, expected_i_impl)
+        try:
+            rebuilt = build_snapshot(raw_universe, sources, claim)
+        except PitError as exc:
+            raise PitError("RAW_REDERIVATION_MISMATCH") from exc
+        rebuilt["previous_ledger_head"] = snapshot["previous_ledger_head"]
+        if canonical_bytes(rebuilt) != canonical_bytes(snapshot):
+            raise PitError("RAW_REDERIVATION_MISMATCH")
+
+
+def reconstruct_snapshot_sources(
+    claim: dict[str, Any],
+    source_manifests: list[dict[str, Any]],
+    history: GitContext,
+    expected_i_impl: str,
+) -> tuple[bytes, dict[str, Any]]:
+    if not SHA256_RE.fullmatch(expected_i_impl) or claim["value"].get("I_impl") != expected_i_impl:
+        raise PitError("IMPLEMENTATION_MISMATCH")
+    if any(
+        not isinstance(item, dict)
+        or item.get("source_id") not in SOURCE_ORDER
+        or type(item.get("page_ordinal")) is not int
+        for item in source_manifests
+    ):
+        raise PitError("SOURCE_PROVENANCE")
+    ordered_manifests = sorted(
+        source_manifests,
+        key=lambda item: (SOURCE_ORDER.index(item["source_id"]), item["page_ordinal"]),
+    )
+    if source_manifests != ordered_manifests:
+        raise PitError("SOURCE_PROVENANCE")
+    groups = {source_id: [] for source_id in SOURCE_ORDER}
+    for manifest in source_manifests:
+        validate_normative(manifest)
+        source_id, page = manifest.get("source_id"), manifest.get("page_ordinal")
+        if source_id not in groups or type(page) is not int or page < 0:
+            raise PitError("SOURCE_PROVENANCE")
+        groups[source_id].append(manifest)
+    if any(not groups[source_id] for source_id in SOURCE_ORDER):
+        raise PitError("INCOMPLETE_SOURCE_SET")
+    if any(len(groups[source_id]) != 1 for source_id in SOURCE_ORDER if source_id != "BY_LINEAR_INSTRUMENTS"):
+        raise PitError("INCOMPLETE_SOURCE_SET")
+    bybit_pages = groups["BY_LINEAR_INSTRUMENTS"]
+    if [item["page_ordinal"] for item in bybit_pages] != list(range(len(bybit_pages))):
+        raise PitError("INCOMPLETE_SOURCE_SET")
+    expected_manifest_paths = {
+        slot_artifact(
+            claim["value"]["formal_slot_utc"], "source-manifests",
+            item["source_id"] + "-" + str(item["page_ordinal"]) + ".json",
+        ): item
+        for item in source_manifests
+    }
+    if history.source_manifests != expected_manifest_paths:
+        raise PitError("SOURCE_PROVENANCE")
+
+    sources: dict[str, Any] = {}
+    referenced_raw: set[str] = set()
+    for source_id in SOURCE_ORDER:
+        parsed_pages = []
+        expected_url = URLS[source_id]
+        for page, manifest in enumerate(groups[source_id]):
+            if (
+                manifest.get("I_impl") != expected_i_impl
+                or manifest.get("page_ordinal") != page
+                or manifest.get("canonical_url_without_secret") != expected_url
+                or (manifest.get("source_status"), manifest.get("parse_status"), manifest.get("qa_status"))
+                != ("SOURCE_OK", "PARSE_OK", "QA_OK")
+                or manifest.get("error_record_relative_path") is not None
+                or manifest.get("error_record_sha256") is not None
+            ):
+                raise PitError("SOURCE_PROVENANCE")
+            raw_path = manifest.get("raw_relative_path")
+            raw = history.raw.get(raw_path)
+            if (
+                raw is None
+                or raw_path != slot_artifact(claim["value"]["formal_slot_utc"], "raw", source_id + "-" + str(page) + ".bin")
+                or manifest.get("raw_bytes") != len(raw)
+                or manifest.get("raw_sha256") != sha256(raw)
+            ):
+                raise PitError("RAW_PROVENANCE")
+            referenced_raw.add(raw_path)
+            try:
+                body = json.loads(raw, parse_constant=_reject_constant)
+            except (json.JSONDecodeError, TypeError, UnicodeDecodeError, PitError) as exc:
+                raise PitError("RAW_REPARSE_FAILURE") from exc
+            if source_id == "CG_TOP250":
+                rows, gap = parse_universe(raw)
+                if rows is None or gap is not None:
+                    raise PitError("RAW_REPARSE_FAILURE")
+                sources[source_id] = body
+            else:
+                validate_source_schema(source_id, body)
+                parsed_pages.append(body)
+            if source_id == "BY_LINEAR_INSTRUMENTS":
+                cursor = body["result"]["nextPageCursor"]
+                if page + 1 < len(groups[source_id]):
+                    if not cursor:
+                        raise PitError("INCOMPLETE_SOURCE_SET")
+                    expected_url = URLS[source_id] + "&cursor=" + urllib.parse.quote(cursor, safe="")
+                elif cursor:
+                    raise PitError("INCOMPLETE_SOURCE_SET")
+        if source_id != "CG_TOP250":
+            sources[source_id] = parsed_pages if source_id == "BY_LINEAR_INSTRUMENTS" else parsed_pages[0]
+    if referenced_raw != set(history.raw):
+        raise PitError("RAW_PROVENANCE")
+    sources["__source_manifests__"] = source_manifests
+    cg_path = groups["CG_TOP250"][0]["raw_relative_path"]
+    return history.raw[cg_path], sources
 
 
 def validate_source_url(source_id: str, url: str) -> None:
@@ -1692,7 +1806,9 @@ class GitWriter:
             observed = self.read_at(commit, relative)
             if observed != data or sha256(observed or b"") != sha256(data):
                 raise PitError("WRITE_UNCONFIRMED")
-            if not raw:
+            if relative == LEDGER_INDEX_PATH:
+                validate_ledger_index(observed)
+            elif not raw:
                 value = validate_canonical(observed)
                 if "/claims/" in relative and (
                     value.get("authorized_writer_identity") != self.writer
@@ -1700,8 +1816,6 @@ class GitWriter:
                     or relative != PREFIX + "claims/" + claim_filesafe(value.get("formal_slot_utc", "")) + ".json"
                 ):
                     raise PitError("EPOCH_WRITER_STOP")
-            elif relative == LEDGER_INDEX_PATH:
-                validate_ledger_index(observed)
 
     def publish_many(
         self,
@@ -1741,7 +1855,14 @@ class GitWriter:
     def publish(self, relative: str, data: bytes, expected_parent: str, message: str, raw: bool = False) -> tuple[str, str]:
         return self.publish_many({relative: (data, raw)}, expected_parent, message)
 
-    def verify_duplicate(self, key: str, expected_parent: str | None, head: str, h0: str) -> str:
+    def verify_duplicate(
+        self,
+        key: str,
+        expected_parent: str | None,
+        head: str,
+        h0: str,
+        expected_i_impl: str,
+    ) -> str:
         try:
             self.verify_history(h0, head)
         except PitError:
@@ -1751,6 +1872,8 @@ class GitWriter:
         outcome_path = artifact_path(PREFIX + "outcomes/" + claim_filesafe(slot) + ".json")
         claim_data, outcome_data = self.read_at(head, claim_path), self.read_at(head, outcome_path)
         claim = validate_canonical(claim_data) if claim_data is not None else None
+        if not SHA256_RE.fullmatch(expected_i_impl) or claim is not None and claim.get("I_impl") != expected_i_impl:
+            return "EPOCH_WRITER_STOP"
         if claim is None:
             if outcome_data is None:
                 return "EPOCH_WRITER_STOP"
@@ -1782,6 +1905,8 @@ class GitWriter:
         if outcome_data is None:
             return "CLAIM_HELD_NO_WRITE"
         outcome = validate_canonical(outcome_data)
+        if outcome.get("I_impl") != expected_i_impl:
+            return "EPOCH_WRITER_STOP"
         outcome_commits = self.git("log", "--format=%H", "--diff-filter=A", head, "--", outcome_path).stdout.splitlines()
         if len(outcome_commits) != 1:
             return "EPOCH_WRITER_STOP"
@@ -1790,11 +1915,12 @@ class GitWriter:
         outcome_delta = self.git("diff-tree", "--no-commit-id", "--name-only", "-r", outcome_commit).stdout.splitlines()
         outcome_author = self.git("show", "-s", "--format=%an <%ae>", outcome_commit).stdout.strip()
         slot_manifest_path = artifact_path(slot_root(slot) + "slot-manifest.json")
+        checkpoint_path = artifact_path(PREFIX + "checkpoints/" + claim_filesafe(slot) + ".json")
         if (
             outcome.get("idempotency_key") != key
             or len(outcome_parents) != 1
             or outcome.get("previous_ledger_head") != outcome_parents[0]
-            or outcome_delta != sorted([outcome_path, slot_manifest_path])
+            or outcome_delta != sorted([LEDGER_INDEX_PATH, checkpoint_path, outcome_path, slot_manifest_path])
             or outcome_author != self.writer
         ):
             return "EPOCH_WRITER_STOP"
@@ -1829,7 +1955,7 @@ class GitWriter:
         if outcome.get("source_manifest_sha256s") != manifest_hashes:
             return "EPOCH_WRITER_STOP"
         for manifest in manifests:
-            if manifest.get("I_impl") != outcome.get("I_impl"):
+            if manifest.get("I_impl") != expected_i_impl:
                 return "EPOCH_WRITER_STOP"
             if manifest.get("raw_relative_path"):
                 raw = self.read_at(head, manifest["raw_relative_path"])
@@ -1849,6 +1975,25 @@ class GitWriter:
         records = [item for item in self.ledger_records(head) if item.get("idempotency_key") == key]
         if len(records) != 1 or records[0].get("outcome_sha256") != sha256(outcome_data) or records[0].get("slot_manifest_sha256") != sha256(slot_manifest_data):
             return "EPOCH_WRITER_STOP"
+        checkpoint_data = self.read_at(head, checkpoint_path)
+        if checkpoint_data is None:
+            return "EPOCH_WRITER_STOP"
+        checkpoint = validate_canonical(checkpoint_data)
+        record = records[0]
+        if checkpoint != {
+            "formal_slot_utc": slot,
+            "ledger_index_sha256": sha256(self.read_at(head, LEDGER_INDEX_PATH) or b""),
+            "ledger_seq": record["ledger_seq"],
+            "terminal_parent": outcome_parents[0],
+        } or slot_manifest.get("ledger_seq") != record["ledger_seq"]:
+            return "EPOCH_WRITER_STOP"
+        if "assets" in outcome:
+            try:
+                context = self.context(h0, head, key)
+                wrapped_claim = {"relative_path": claim_path, "value": claim}
+                validate_snapshot(outcome, wrapped_claim, manifests, context, True, expected_i_impl)
+            except PitError:
+                return "EPOCH_WRITER_STOP"
         return "DUPLICATE_NO_WRITE"
 
     def ledger_records(self, head: str) -> list[dict[str, Any]]:
@@ -1862,9 +2007,12 @@ class GitWriter:
         kind: str,
         reasons: Iterable[str],
         claim_exists: bool,
+        expected_i_impl: str,
         payload: dict[str, Any] | None = None,
     ) -> tuple[str, str]:
         key, slot = claim["value"]["idempotency_key"], claim["value"]["formal_slot_utc"]
+        if not SHA256_RE.fullmatch(expected_i_impl) or claim["value"].get("I_impl") != expected_i_impl:
+            return "EPOCH_WRITER_STOP", self.remote_head()
         head = self.remote_head()
         self.verify_history(h0, head)
         log_path, log = claim["value"]["log_locator"], run_log_bytes(claim)
@@ -1920,32 +2068,40 @@ class GitWriter:
         }
         slot_manifest_path = artifact_path(slot_root(slot) + "slot-manifest.json")
         slot_manifest_bytes = canonical_bytes(slot_manifest)
-        status, outcome_head = self.publish_many(
-            {outcome_path: (outcome_bytes, False), slot_manifest_path: (slot_manifest_bytes, False)},
-            head, "PIT slot outcome",
-        )
-        if status != "PUBLISHED":
-            return status, outcome_head
         record = {
             "formal_slot_utc": slot, "idempotency_key": key, "ledger_seq": seq,
             "outcome_relative_path": outcome_path, "outcome_sha256": sha256(outcome_bytes),
             "slot_manifest_relative_path": slot_manifest_path,
             "slot_manifest_sha256": sha256(slot_manifest_bytes),
         }
-        old_index = self.read_at(outcome_head, LEDGER_INDEX_PATH) or b""
+        old_index = self.read_at(head, LEDGER_INDEX_PATH) or b""
         index = old_index + canonical_bytes(record)
         validate_ledger_index(index)
         checkpoint_path = artifact_path(PREFIX + "checkpoints/" + claim_filesafe(slot) + ".json")
         checkpoint = canonical_bytes({
             "formal_slot_utc": slot, "ledger_index_sha256": sha256(index),
-            "ledger_seq": seq, "outcome_head": outcome_head,
+            "ledger_seq": seq, "terminal_parent": head,
         })
-        return self.publish_many(
-            {LEDGER_INDEX_PATH: (index, True), checkpoint_path: (checkpoint, False)},
-            outcome_head, "PIT checkpoint",
+        status, terminal_head = self.publish_many(
+            {
+                LEDGER_INDEX_PATH: (index, True),
+                checkpoint_path: (checkpoint, False),
+                outcome_path: (outcome_bytes, False),
+                slot_manifest_path: (slot_manifest_bytes, False),
+            },
+            head, "PIT slot terminal",
         )
+        if status == "PUBLISHED":
+            return status, terminal_head
+        return self.verify_duplicate(key, None, terminal_head, h0, expected_i_impl), terminal_head
 
-    def recover_slot(self, h0: str, claim: dict[str, Any], now: datetime) -> tuple[str, str]:
+    def recover_slot(
+        self,
+        h0: str,
+        claim: dict[str, Any],
+        now: datetime,
+        expected_i_impl: str,
+    ) -> tuple[str, str]:
         slot, key = claim["value"]["formal_slot_utc"], claim["value"]["idempotency_key"]
         head = self.remote_head()
         if now.astimezone(timezone.utc) < materialization_deadline(slot):
@@ -1954,7 +2110,7 @@ class GitWriter:
         claim_path = claim["relative_path"]
         outcome_path = artifact_path(PREFIX + "outcomes/" + claim_filesafe(slot) + ".json")
         if self.read_at(head, outcome_path) is not None:
-            return self.verify_duplicate(key, None, head, h0), head
+            return self.verify_duplicate(key, None, head, h0, expected_i_impl), head
         claim_data = self.read_at(head, claim_path)
         if claim_data is not None:
             observed = validate_canonical(claim_data)
@@ -1963,13 +2119,13 @@ class GitWriter:
             existing = {"relative_path": claim_path, "value": observed}
             context = self.context(h0, head, key)
             reasons = ["ATTEMPT_ABORTED"] + ([] if context.raw else ["NO_RAW_DURABLY_PUBLISHED"])
-            return self.publish_terminal(h0, existing, "ABORTED_ATTEMPT", reasons, True)
+            return self.publish_terminal(h0, existing, "ABORTED_ATTEMPT", reasons, True, expected_i_impl)
         if not self.history_absent(h0, head, claim_path):
             return "EPOCH_WRITER_STOP", head
-        return self.publish_terminal(h0, claim, "GAP_NO_RUN", ["NO_CLAIM_BEFORE_DEADLINE"], False)
+        return self.publish_terminal(h0, claim, "GAP_NO_RUN", ["NO_CLAIM_BEFORE_DEADLINE"], False, expected_i_impl)
 
-    def recover_gap(self, h0: str, claim: dict[str, Any], now: datetime) -> tuple[str, str]:
-        return self.recover_slot(h0, claim, now)
+    def recover_gap(self, h0: str, claim: dict[str, Any], now: datetime, expected_i_impl: str) -> tuple[str, str]:
+        return self.recover_slot(h0, claim, now, expected_i_impl)
 
 
 def _live_send(source_id: str, url: str, api_key: str) -> tuple[int, bytes, dict[str, str]]:
@@ -1987,6 +2143,36 @@ def _live_send(source_id: str, url: str, api_key: str) -> tuple[int, bytes, dict
         return exc.code, exc.read(), dict(exc.headers)
 
 
+def prepare_live_slot(
+    writer: GitWriter,
+    h0: str,
+    activation_slot: str,
+    slot: str,
+    now: datetime,
+    i_impl: str,
+    writer_id: str,
+    workflow_run_id: str = "recovery-run",
+    job_id: str = "capture",
+) -> str:
+    records = writer.ledger_records(writer.remote_head())
+    overdue = add_slots(records[-1]["formal_slot_utc"]) if records else activation_slot
+    while overdue <= slot and now >= materialization_deadline(overdue):
+        recovery_claim = make_claim(
+            overdue, i_impl, writer_id, writer.remote_head(),
+            now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z",
+            workflow_run_id, job_id,
+        )
+        status, _ = writer.recover_slot(h0, recovery_claim, now, i_impl)
+        if status not in {"PUBLISHED", "DUPLICATE_NO_WRITE"}:
+            raise PitError("EPOCH_WRITER_STOP")
+        overdue = add_slots(overdue)
+    if overdue < slot:
+        raise PitError("EPOCH_WRITER_STOP")
+    if overdue == slot:
+        acquisition_window(slot, now)
+    return writer.remote_head()
+
+
 def live_capture() -> None:
     env = dict(os.environ)
     root = os.path.dirname(os.path.abspath(__file__))
@@ -1995,25 +2181,20 @@ def live_capture() -> None:
     minute = 30 if now.minute >= 30 else 0
     slot_dt = now.replace(minute=minute, second=0, microsecond=0)
     slot = slot_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
-    acquisition_window(slot, now)
     writer_id = env["PIT_AUTHORIZED_WRITER"]
     writer = GitWriter(root, writer_id)
     head = writer.remote_head()
     writer.verify_history(env["PIT_H0"], head)
-    records = writer.ledger_records(head)
-    overdue = add_slots(records[-1]["formal_slot_utc"]) if records else env["PIT_ACTIVATION_CANDIDATE_SLOT"]
-    while overdue < slot and datetime.now(timezone.utc) >= materialization_deadline(overdue):
-        recovery_claim = make_claim(
-            overdue, env["PIT_I_IMPL"], writer_id, writer.remote_head(),
-            datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.") + f"{datetime.now(timezone.utc).microsecond // 1000:03d}Z",
-            env.get("GITHUB_RUN_ID", "recovery-run"), env.get("GITHUB_JOB", "capture"),
-        )
-        status, _ = writer.recover_slot(env["PIT_H0"], recovery_claim, datetime.now(timezone.utc))
-        if status not in {"PUBLISHED", "DUPLICATE_NO_WRITE"}:
-            raise PitError("EPOCH_WRITER_STOP")
-        overdue = add_slots(overdue)
-    if overdue < slot:
-        raise PitError("EPOCH_WRITER_STOP")
+    head = prepare_live_slot(
+        writer, env["PIT_H0"], env["PIT_ACTIVATION_CANDIDATE_SLOT"], slot, now,
+        env["PIT_I_IMPL"], writer_id, env.get("GITHUB_RUN_ID", "recovery-run"),
+        env.get("GITHUB_JOB", "capture"),
+    )
+    key = EPOCH_ID + "|" + slot
+    outcome_path = artifact_path(PREFIX + "outcomes/" + claim_filesafe(slot) + ".json")
+    if writer.read_at(head, outcome_path) is not None:
+        print(writer.verify_duplicate(key, None, head, env["PIT_H0"], env["PIT_I_IMPL"]))
+        return
     claim = make_claim(
         slot, env["PIT_I_IMPL"], writer_id, head,
         now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z",
@@ -2022,11 +2203,13 @@ def live_capture() -> None:
     )
     key, claim_path = claim["value"]["idempotency_key"], claim["relative_path"]
     if not writer.history_absent(env["PIT_H0"], head, claim_path):
-        print(writer.verify_duplicate(key, None, head, env["PIT_H0"]))
+        print(writer.verify_duplicate(key, None, head, env["PIT_H0"], env["PIT_I_IMPL"]))
         return
     status, head = writer.publish(claim_path, canonical_bytes(claim["value"]), head, "PIT claim")
     if status != "PUBLISHED":
-        print(writer.verify_duplicate(key, claim["value"]["expected_parent_before_claim"], head, env["PIT_H0"]))
+        print(writer.verify_duplicate(
+            key, claim["value"]["expected_parent_before_claim"], head, env["PIT_H0"], env["PIT_I_IMPL"]
+        ))
         return
     ledger = Ledger(writer_id, head=head)
     ledger.claims[key] = claim
@@ -2036,7 +2219,7 @@ def live_capture() -> None:
         nonlocal head
         status, new_head = writer.publish(relative, data, head, "PIT artifact", raw)
         if status != "PUBLISHED":
-            raise PitError(writer.verify_duplicate(key, head, new_head, env["PIT_H0"]))
+            raise PitError(writer.verify_duplicate(key, head, new_head, env["PIT_H0"], env["PIT_I_IMPL"]))
         head = new_head
 
     parsed = acquire_fixture_sources(
@@ -2051,16 +2234,16 @@ def live_capture() -> None:
     if "assets" in outcome:
         validate_snapshot(outcome)
     status, final_head = writer.publish_terminal(
-        env["PIT_H0"], claim, outcome["outcome_kind"], outcome["reason_codes"], True, outcome
+        env["PIT_H0"], claim, outcome["outcome_kind"], outcome["reason_codes"], True, env["PIT_I_IMPL"], outcome
     )
-    if status != "PUBLISHED":
+    if status not in {"PUBLISHED", "DUPLICATE_NO_WRITE"}:
         raise PitError("EPOCH_WRITER_STOP")
     if "assets" in outcome:
         final = validate_canonical(writer.read_at(final_head, PREFIX + "outcomes/" + claim_filesafe(slot) + ".json") or b"")
         context = writer.context(env["PIT_H0"], final_head, key)
         manifests = sorted(context.source_manifests.values(), key=lambda item: (SOURCE_ORDER.index(item["source_id"]), item["page_ordinal"]))
-        validate_snapshot(final, claim, manifests, context, True)
-    print("PUBLISHED_SLOT_OUTCOME")
+        validate_snapshot(final, claim, manifests, context, True, env["PIT_I_IMPL"])
+    print("PUBLISHED_SLOT_OUTCOME" if status == "PUBLISHED" else "DUPLICATE_NO_WRITE")
 
 
 def oracle_objects() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
@@ -2146,7 +2329,7 @@ def e2e_self_check() -> None:
         b.git("commit", "--quiet", "-m", "losing non-fast-forward")
         rejected = b.git("push", "origin", f"HEAD:refs/heads/{b.branch}", check=False)
         assert rejected.returncode != 0 and b.remote_head() == claim_head
-        assert b.verify_duplicate(key, h0, raced_head, h0) == "CLAIM_HELD_NO_WRITE"
+        assert b.verify_duplicate(key, h0, raced_head, h0, "A" * 64) == "CLAIM_HELD_NO_WRITE"
         raw_path = slot_artifact(slot, "raw", "CG_TOP250-0.bin")
         raw = b'{"fixture":true}'
         status, raw_head = a.publish(raw_path, raw, claim_head, "raw", True)
@@ -2177,23 +2360,32 @@ def e2e_self_check() -> None:
             manifest_files[slot_artifact(slot, "source-manifests", source_id + "-0.json")] = (canonical_bytes(not_run), False)
         status, _ = a.publish_many(manifest_files, raw_head, "source manifests")
         assert status == "PUBLISHED"
-        status, complete_head = a.publish_terminal(h0, claim, "ABORTED_ATTEMPT", ["ATTEMPT_ABORTED"], True)
+        status, complete_head = a.publish_terminal(
+            h0, claim, "ABORTED_ATTEMPT", ["ATTEMPT_ABORTED"], True, "A" * 64
+        )
         assert status == "PUBLISHED"
-        assert b.verify_duplicate(key, h0, complete_head, h0) == "DUPLICATE_NO_WRITE"
+        assert b.verify_duplicate(key, h0, complete_head, h0, "A" * 64) == "DUPLICATE_NO_WRITE"
+        assert b.verify_duplicate(key, h0, complete_head, h0, "B" * 64) == "EPOCH_WRITER_STOP"
         slot2 = add_slots(slot)
         claim2 = make_claim(slot2, "A" * 64, writer_identity, complete_head)
         status, _ = a.publish(claim2["relative_path"], canonical_bytes(claim2["value"]), complete_head, "stale claim")
         assert status == "PUBLISHED"
-        status, aborted_head = a.recover_slot(h0, claim2, datetime(2026, 7, 26, 20, 46, tzinfo=timezone.utc))
+        status, aborted_head = a.recover_slot(
+            h0, claim2, datetime(2026, 7, 26, 20, 46, tzinfo=timezone.utc), "A" * 64
+        )
         assert status == "PUBLISHED"
         aborted = validate_canonical(a.read_at(aborted_head, PREFIX + "outcomes/" + claim_filesafe(slot2) + ".json") or b"")
         assert aborted["outcome_kind"] == "ABORTED_ATTEMPT"
         slot3 = add_slots(slot2)
         gap_claim = make_claim(slot3, "A" * 64, writer_identity, aborted_head)
         before = a.remote_head()
-        assert a.recover_slot(h0, gap_claim, datetime(2026, 7, 26, 21, 14, tzinfo=timezone.utc))[0] == "EPOCH_WRITER_STOP"
+        assert a.recover_slot(
+            h0, gap_claim, datetime(2026, 7, 26, 21, 14, tzinfo=timezone.utc), "A" * 64
+        )[0] == "EPOCH_WRITER_STOP"
         assert a.remote_head() == before
-        status, recovery_head = a.recover_slot(h0, gap_claim, datetime(2026, 7, 26, 21, 16, tzinfo=timezone.utc))
+        status, recovery_head = a.recover_slot(
+            h0, gap_claim, datetime(2026, 7, 26, 21, 16, tzinfo=timezone.utc), "A" * 64
+        )
         assert status == "PUBLISHED"
         gap = validate_canonical(a.read_at(recovery_head, PREFIX + "outcomes/" + claim_filesafe(slot3) + ".json") or b"")
         assert gap["outcome_kind"] == "GAP_NO_RUN"
@@ -2207,15 +2399,53 @@ def e2e_self_check() -> None:
             assert str(exc) == "FORCE_FORBIDDEN"
         else:
             raise AssertionError("force was not forbidden")
-        bad_slot = add_slots(slot3)
-        bad_claim = make_claim(bad_slot, "A" * 64, writer_identity, recovery_head)
-        status, bad_claim_head = a.publish(bad_claim["relative_path"], canonical_bytes(bad_claim["value"]), recovery_head, "bad provenance claim")
+
+        crash_slot = add_slots(slot3)
+        crash_claim = make_claim(crash_slot, "A" * 64, writer_identity, recovery_head)
+        status, crash_claim_head = a.publish(
+            crash_claim["relative_path"], canonical_bytes(crash_claim["value"]), recovery_head, "crash claim"
+        )
+        assert status == "PUBLISHED"
+        status, log_head = a.publish(
+            crash_claim["value"]["log_locator"], run_log_bytes(crash_claim), crash_claim_head, "crash log", True
+        )
+        assert status == "PUBLISHED"
+
+        class CrashAfterRemoteAcceptance(GitWriter):
+            def verify_commit(self, commit: str, parent: str, files: dict[str, tuple[bytes, bool]]) -> None:
+                super().verify_commit(commit, parent, files)
+                raise RuntimeError("SIMULATED_CRASH_AFTER_REMOTE_ACCEPTANCE")
+
+        crashing = CrashAfterRemoteAcceptance(clones[0], writer_identity)
+        try:
+            crashing.publish_terminal(
+                h0, crash_claim, "ABORTED_ATTEMPT",
+                ["ATTEMPT_ABORTED", "NO_RAW_DURABLY_PUBLISHED"], True, "A" * 64,
+            )
+        except RuntimeError as exc:
+            assert str(exc) == "SIMULATED_CRASH_AFTER_REMOTE_ACCEPTANCE"
+        else:
+            raise AssertionError("terminal crash was not simulated")
+        crash_head = a.remote_head()
+        status, resumed_head = a.recover_slot(
+            h0, crash_claim, datetime(2026, 7, 26, 21, 46, tzinfo=timezone.utc), "A" * 64
+        )
+        assert status == "DUPLICATE_NO_WRITE" and resumed_head == crash_head
+        assert [row["ledger_seq"] for row in a.ledger_records(resumed_head)] == [1, 2, 3, 4]
+
+        bad_slot = add_slots(crash_slot)
+        bad_claim = make_claim(bad_slot, "A" * 64, writer_identity, resumed_head)
+        status, bad_claim_head = a.publish(bad_claim["relative_path"], canonical_bytes(bad_claim["value"]), resumed_head, "bad provenance claim")
         assert status == "PUBLISHED"
         bad_outcome = base_outcome(bad_claim, "ABORTED_ATTEMPT", ["ATTEMPT_ABORTED", "NO_RAW_DURABLY_PUBLISHED"], [], bad_claim_head)
         bad_outcome.update(I_impl="B" * 64, workflow_run_id="wrong-run", job_id="wrong-job")
-        status, bad_head = a.publish_terminal(h0, bad_claim, "ABORTED_ATTEMPT", bad_outcome["reason_codes"], True, bad_outcome)
+        status, bad_head = a.publish_terminal(
+            h0, bad_claim, "ABORTED_ATTEMPT", bad_outcome["reason_codes"], True, "A" * 64, bad_outcome
+        )
         assert status == "PUBLISHED"
-        assert a.verify_duplicate(bad_claim["value"]["idempotency_key"], recovery_head, bad_head, h0) == "EPOCH_WRITER_STOP"
+        assert a.verify_duplicate(
+            bad_claim["value"]["idempotency_key"], resumed_head, bad_head, h0, "A" * 64
+        ) == "EPOCH_WRITER_STOP"
         wrong = GitWriter(clones[2], writer_identity)
         wrong_claim = make_claim(add_slots(bad_slot), "A" * 64, writer_identity, bad_head)
         try:
