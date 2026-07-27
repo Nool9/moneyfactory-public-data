@@ -825,14 +825,22 @@ def validate_snapshot(
                     if row["missing_reasons"] != ["NOT_APPLICABLE_NO_PERP"] or any(row[field] is not None for field in prices):
                         raise PitError("PERP_RELATION")
                 elif row["perp_exists"] is True:
-                    if any(row[field] is None for field in prices):
+                    market_complete = all(row[field] is not None for field in prices)
+                    market_missing = all(row[field] is None for field in prices)
+                    source_errors = {"SOURCE_FAILURE", "PARSE_FAILURE", "SCHEMA_FAILURE", "DERIVATION_FAILURE", "QA_FAILURE"}
+                    error_reasons = set(row["missing_reasons"])
+                    error_state = bool(error_reasons) and error_reasons <= source_errors and error_reasons <= set(reasons)
+                    if not market_complete and not (market_missing and error_state):
                         raise PitError("PERP_RELATION")
-                    if row["spread_bps"] != spread_bps(row["bid_price"], row["ask_price"]):
-                        raise PitError("SPREAD_RELATION")
-                    validate_utc(row["funding_observed_at_utc"])
-                    for field in ("funding_rate", "bid_price", "ask_price", "mark_price", "index_price"):
-                        parse_decimal_string(row[field], positive=field != "funding_rate")
-                    if row["missing_reasons"]:
+                    if market_complete:
+                        if row["spread_bps"] != spread_bps(row["bid_price"], row["ask_price"]):
+                            raise PitError("SPREAD_RELATION")
+                        validate_utc(row["funding_observed_at_utc"])
+                        for field in ("funding_rate", "bid_price", "ask_price", "mark_price", "index_price"):
+                            parse_decimal_string(row[field], positive=field != "funding_rate")
+                    if row["borrowable"] is None and not error_state:
+                        raise PitError("BORROWABLE_RELATION")
+                    if error_reasons and not error_state or market_complete and row["borrowable"] is not None and error_reasons:
                         raise PitError("PERP_RELATION")
                 else:
                     if any(row[field] is not None for field in prices):
@@ -844,7 +852,7 @@ def validate_snapshot(
                     }
                     if tuple(row["missing_reasons"]) not in allowed_null_reasons:
                         raise PitError("PERP_RELATION")
-                if row["borrowable"] is None and not any(code in row["missing_reasons"] for code in ("SOURCE_FAILURE", "PARSE_FAILURE", "SCHEMA_FAILURE", "QA_FAILURE")):
+                if row["borrowable"] is None and not any(code in row["missing_reasons"] for code in ("SOURCE_FAILURE", "PARSE_FAILURE", "SCHEMA_FAILURE", "DERIVATION_FAILURE", "QA_FAILURE")):
                     raise PitError("BORROWABLE_RELATION")
             for digest in row["source_raw_sha256s"]:
                 if digest not in snapshot.get("available_raw_sha256s", []):

@@ -42,7 +42,7 @@ def bybit_instrument(base="BTC"):
     }
 
 
-def complete_snapshot_fixture(bybit_page_count=1):
+def complete_snapshot_fixture(bybit_page_count=1, binance_case=None):
     writer, slot = "writer", "2026-07-26T20:00:00.000Z"
     ledger = p.Ledger(writer)
     claim = p.make_claim(slot, "A" * 64, writer, ledger.head)
@@ -55,6 +55,17 @@ def complete_snapshot_fixture(bybit_page_count=1):
         "BY_SPOT_INSTRUMENTS": b'{"result":{"list":[]}}',
         "BY_MARGIN_BORROWABLE": b'{"result":{"list":[]}}',
     }
+    if binance_case in {"missing_ticker", "borrow_failure"}:
+        bodies["BN_FUT_EXCHANGE_INFO"] = json.dumps(
+            {"symbols": [binance_instrument("X0")]}, separators=(",", ":")
+        ).encode()
+    if binance_case == "borrow_failure":
+        bodies.update(
+            BN_FUT_PREMIUM_INDEX=b'[{"indexPrice":"100","lastFundingRate":"0.001","markPrice":"100","symbol":"X0USDT","time":1720000000123}]',
+            BN_FUT_BOOK_TICKER=b'[{"askPrice":"100","bidPrice":"99","symbol":"X0USDT"}]',
+            BN_MARGIN_ASSETS=b'[{"assetName":"X0","isBorrowable":true},{"assetName":"X0","isBorrowable":true}]',
+            BN_MARGIN_PAIRS=b'[{"base":"X0","isMarginTrade":true,"isSellAllowed":true,"quote":"USDT"}]',
+        )
     bybit_pages = [
         b'{"result":{"list":[],"nextPageCursor":"next"}}',
         b'{"result":{"list":[],"nextPageCursor":""}}',
@@ -624,6 +635,53 @@ class PermissionAndStaticTests(unittest.TestCase):
                 venue["source_raw_sha256s"] = []
         with self.assertRaises(p.PitError):
             p.validate_snapshot(empty, claim, manifests, context, False, "A" * 64)
+
+    def test_existing_perp_missing_ticker_is_snapshot_partial(self):
+        _, _, snapshot, _ = complete_snapshot_fixture(binance_case="missing_ticker")
+        row = snapshot["assets"][0]["venues"][0]
+        self.assertIs(row["perp_exists"], True)
+        self.assertIs(row["borrowable"], False)
+        self.assertTrue(all(row[field] is None for field in (
+            "funding_rate", "funding_observed_at_utc", "bid_price", "ask_price",
+            "spread_bps", "mark_price", "index_price",
+        )))
+        self.assertEqual(row["missing_reasons"], ["SCHEMA_FAILURE"])
+        self.assertEqual(
+            (snapshot["outcome_kind"], snapshot["slot_status"], snapshot["reason_codes"]),
+            ("SNAPSHOT_PARTIAL", "PARTIAL", ["SCHEMA_FAILURE"]),
+        )
+        inconsistent = json.loads(json.dumps(snapshot))
+        inconsistent["assets"][0]["venues"][0]["funding_rate"] = "0.001"
+        with self.assertRaises(p.PitError):
+            p.validate_snapshot(inconsistent)
+
+    def test_existing_perp_independent_borrow_failure_is_snapshot_partial(self):
+        _, _, snapshot, _ = complete_snapshot_fixture(binance_case="borrow_failure")
+        row = snapshot["assets"][0]["venues"][0]
+        self.assertIs(row["perp_exists"], True)
+        self.assertIsNone(row["borrowable"])
+        self.assertEqual(
+            (
+                row["funding_rate"], row["funding_observed_at_utc"], row["bid_price"],
+                row["ask_price"], row["spread_bps"], row["mark_price"], row["index_price"],
+            ),
+            ("0.001", "2024-07-03T09:46:40.123Z", "99", "100", "100.50251256", "100", "100"),
+        )
+        self.assertEqual(row["missing_reasons"], ["SCHEMA_FAILURE"])
+        self.assertEqual(
+            (snapshot["outcome_kind"], snapshot["slot_status"], snapshot["reason_codes"]),
+            ("SNAPSHOT_PARTIAL", "PARTIAL", ["SCHEMA_FAILURE"]),
+        )
+        inconsistent = json.loads(json.dumps(snapshot))
+        inconsistent["assets"][0]["venues"][0]["borrowable"] = False
+        with self.assertRaises(p.PitError):
+            p.validate_snapshot(inconsistent)
+
+    def test_contextual_raw_rederivation_accepts_both_legal_partials(self):
+        for case in ("missing_ticker", "borrow_failure"):
+            with self.subTest(case=case):
+                claim, manifests, snapshot, context = complete_snapshot_fixture(binance_case=case)
+                p.validate_snapshot(snapshot, claim, manifests, context, False, "A" * 64)
 
     def test_missing_any_source_or_page_rejected(self):
         claim, manifests, snapshot, context = complete_snapshot_fixture(2)
