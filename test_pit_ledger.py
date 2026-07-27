@@ -2,7 +2,8 @@ import json
 import os
 import subprocess
 import unittest
-from decimal import Decimal
+from datetime import datetime, timezone
+from decimal import Decimal, localcontext
 from pathlib import Path
 
 import pit_ledger as p
@@ -147,7 +148,20 @@ class CanonicalTests(unittest.TestCase):
         r301 = p.oracle_objects()[2]
         for reasons in (["AMBIGUOUS_EXCHANGE_PRODUCT"], ["AMBIGUOUS_EXCHANGE_PRODUCT", "QA_FAILURE", "SCHEMA_FAILURE"]):
             bad = dict(r301, missing_reasons=reasons)
-            self.assertNotEqual(p.canonical_bytes(bad), p.canonical_bytes(r301))
+            with self.assertRaises(p.PitError):
+                p.canonical_bytes(bad)
+
+    def test_contextual_array_hash_and_jsonl_witnesses(self):
+        with self.assertRaises(p.PitError):
+            p.canonical_jsonl([{"ledger_seq": 2}, {"ledger_seq": 1}])
+        for value in (
+            {"raw_sha256": "a" * 64},
+            {"x": [2, 1]},
+            {"files": [{"path": "z"}, {"path": "a"}]},
+            {"available_raw_sha256s": ["B" * 64, "A" * 64]},
+        ):
+            with self.assertRaises(p.PitError, msg=value):
+                p.canonical_bytes(value)
 
 
 class UniverseAndMappingTests(unittest.TestCase):
@@ -262,6 +276,12 @@ class DerivationAndSourceTests(unittest.TestCase):
         for bid, ask in (("0", "1"), ("2", "1"), ("1e0", "2"), (1, "2")):
             with self.assertRaises(p.PitError):
                 p.spread_bps(bid, ask)
+        with localcontext() as context:
+            context.prec = 6
+            self.assertEqual(
+                p.spread_bps("397999999999900000000000000000000", "402000000000100000000000000000001"),
+                "100.00000001",
+            )
 
     def test_funding_timestamp_binance_row_and_bybit_top_level(self):
         stamp = 1720000000123
@@ -301,6 +321,9 @@ class DerivationAndSourceTests(unittest.TestCase):
         self.assertEqual(p.paginate_bybit(fetch), bodies)
         self.assertEqual(seen[1], p.URLS["BY_LINEAR_INSTRUMENTS"] + "&cursor=a%2Fb")
         self.assertEqual(len(seen), 3)
+        repeated = iter((b'{"result":{"nextPageCursor":"x"}}', b'{"result":{"nextPageCursor":"x"}}'))
+        with self.assertRaises(p.PitError):
+            p.paginate_bybit(lambda _: next(repeated))
 
     def test_retry_only_transport_429_5xx_no_quality_selection(self):
         calls, sleeps = [], []
@@ -343,7 +366,7 @@ class WriterProtocolTests(unittest.TestCase):
             self.ledger.parse_after_raw(self.key, json.loads)
 
     def test_no_claim_recovery_gap_no_run(self):
-        result = self.ledger.recover(self.claim, self.writer, self.ledger.head)
+        result = self.ledger.recover(self.claim, self.writer, self.ledger.head, datetime(2026, 7, 26, 20, 16, tzinfo=timezone.utc))
         self.assertEqual(result, "PUBLISHED_SLOT_OUTCOME")
         outcome = self.ledger.outcomes[self.key]
         self.assertEqual(outcome["outcome_kind"], "GAP_NO_RUN")
@@ -352,7 +375,7 @@ class WriterProtocolTests(unittest.TestCase):
     def test_claim_recovery_aborted_preserves_raw_run_job_log(self):
         self.assertEqual(self.ledger.claim(self.claim, self.writer, self.ledger.head), "CLAIMED")
         self.ledger.archive_raw(self.key, "CG_TOP250", b"raw")
-        self.assertEqual(self.ledger.recover(self.claim, self.writer, self.ledger.head), "PUBLISHED_SLOT_OUTCOME")
+        self.assertEqual(self.ledger.recover(self.claim, self.writer, self.ledger.head, datetime(2026, 7, 26, 20, 16, tzinfo=timezone.utc)), "PUBLISHED_SLOT_OUTCOME")
         outcome = self.ledger.outcomes[self.key]
         self.assertEqual(outcome["outcome_kind"], "ABORTED_ATTEMPT")
         self.assertEqual(outcome["available_raw_count"], 1)
@@ -362,7 +385,7 @@ class WriterProtocolTests(unittest.TestCase):
 
     def test_aborted_without_raw_has_exact_reasons(self):
         self.ledger.claim(self.claim, self.writer, self.ledger.head)
-        self.ledger.recover(self.claim, self.writer, self.ledger.head)
+        self.ledger.recover(self.claim, self.writer, self.ledger.head, datetime(2026, 7, 26, 20, 16, tzinfo=timezone.utc))
         self.assertEqual(
             self.ledger.outcomes[self.key]["reason_codes"],
             ["ATTEMPT_ABORTED", "NO_RAW_DURABLY_PUBLISHED"],
@@ -370,12 +393,16 @@ class WriterProtocolTests(unittest.TestCase):
 
     def test_two_runs_exactly_one_outcome_and_verified_duplicate(self):
         self.ledger.claim(self.claim, self.writer, self.ledger.head)
-        outcome = p.base_outcome(self.claim, "SNAPSHOT_COMPLETE", [], [])
+        outcome = p.base_outcome(self.claim, "SNAPSHOT_COMPLETE", [], [], self.ledger.head)
         self.assertEqual(self.ledger.publish_outcome(self.key, outcome, self.writer, self.ledger.head), "PUBLISHED_SLOT_OUTCOME")
         count = len(self.ledger.outcomes)
         self.assertEqual(self.ledger.cas_reject(self.key, self.writer, self.key), "DUPLICATE_NO_WRITE")
         self.assertEqual(len(self.ledger.outcomes), count)
         self.assertEqual(self.ledger.claim(self.claim, self.writer, self.ledger.head), "DUPLICATE_NO_WRITE")
+        self.assertEqual(
+            self.ledger.cas_reject(self.key, self.writer, self.key, outcome["previous_ledger_head"], b"{}\n", p.sha256(p.canonical_bytes(outcome)), [p.PREFIX + "outcomes/" + p.claim_filesafe(self.slot) + ".json"]),
+            "EPOCH_WRITER_STOP",
+        )
 
     def test_cas_claim_held_and_unknown_delta_stops(self):
         self.ledger.claim(self.claim, self.writer, self.ledger.head)
@@ -394,9 +421,18 @@ class WriterProtocolTests(unittest.TestCase):
         for writer, parents, paths, force in cases:
             ledger = p.Ledger(self.writer)
             self.assertEqual(ledger.observe_history(writer, parents, paths, force), "EPOCH_WRITER_STOP")
-            self.assertEqual(ledger.recover(self.claim, self.writer, ledger.head), "EPOCH_WRITER_STOP")
+            self.assertEqual(ledger.recover(self.claim, self.writer, ledger.head, datetime(2026, 7, 26, 20, 16, tzinfo=timezone.utc)), "EPOCH_WRITER_STOP")
             self.assertEqual(ledger.writes_after_stop, 0)
             self.assertEqual(len(ledger.outcomes), 0)
+
+    def test_recovery_before_deadline_and_history_unknown_or_present_stop(self):
+        before = self.ledger.head
+        self.assertEqual(self.ledger.recover(self.claim, self.writer, before, datetime(2026, 7, 26, 20, 14, tzinfo=timezone.utc)), "EPOCH_WRITER_STOP")
+        self.assertEqual(self.ledger.head, before)
+        ledger = p.Ledger(self.writer, history_claim_keys={self.key})
+        self.assertEqual(ledger.recover(self.claim, self.writer, ledger.head, datetime(2026, 7, 26, 20, 16, tzinfo=timezone.utc)), "EPOCH_WRITER_STOP")
+        unknown = p.Ledger(self.writer)
+        self.assertEqual(unknown.recover(self.claim, self.writer, unknown.head, datetime(2026, 7, 26, 20, 16, tzinfo=timezone.utc), False), "EPOCH_WRITER_STOP")
 
     def test_path_allowlist_and_collector_v4_read_boundary(self):
         self.assertEqual(p.artifact_path(p.PREFIX + "claims/x.json"), p.PREFIX + "claims/x.json")
@@ -413,28 +449,91 @@ class WriterProtocolTests(unittest.TestCase):
 
 class PermissionAndStaticTests(unittest.TestCase):
     def test_live_boundary_fail_closed_for_each_missing_permission(self):
+        digest = p.current_i_impl(Path(__file__).parent)
         full = {
             "PIT_ACTIVATION_APPROVED": "YES",
             "PIT_TARGET_WRITE_APPROVED": "YES",
             "PIT_SECRET_APPROVED": "YES",
             "PIT_KEY_PERMISSION_PROOF": "READ_ONLY_MARKET_DATA_NO_TRADE_BORROW_TRANSFER_WITHDRAW",
             "PIT_AUTHORIZED_WRITER": "writer",
-            "PIT_I_IMPL": "A",
-            "PIT_I_IMPL_CURRENT": "A",
+            "PIT_I_IMPL": digest,
             "PIT_H0": "H0",
             "BINANCE_MARKET_DATA_API_KEY": "redacted-fixture",
         }
-        p.require_live_authorization(full)
+        p.require_live_authorization(full, Path(__file__).parent)
         for name in tuple(full):
-            if name == "PIT_I_IMPL_CURRENT":
-                continue
             env = dict(full)
             env.pop(name)
             with self.assertRaises(p.PitError, msg=name):
-                p.require_live_authorization(env)
+                p.require_live_authorization(env, Path(__file__).parent)
         wrong = dict(full, PIT_KEY_PERMISSION_PROOF="TRADE")
         with self.assertRaises(p.PitError):
-            p.require_live_authorization(wrong)
+            p.require_live_authorization(wrong, Path(__file__).parent)
+        for bad in ("A", "0" * 64):
+            with self.assertRaises(p.PitError):
+                p.require_live_authorization(dict(full, PIT_I_IMPL=bad), Path(__file__).parent)
+
+    def test_manifest_recomputed_from_raw_bytes(self):
+        root = Path(__file__).parent
+        manifest = p.implementation_manifest(root)
+        self.assertEqual(manifest, (root / "implementation_manifest.json").read_bytes())
+        value = json.loads(manifest)
+        self.assertEqual([item["path"] for item in value["files"]], list(p.IMPLEMENTATION_FILES))
+        for item in value["files"]:
+            raw = (root / item["path"]).read_bytes()
+            self.assertEqual((item["bytes"], item["sha256"]), (len(raw), p.sha256(raw)))
+
+    def test_bad_source_schema_is_total_and_never_qa_ok(self):
+        writer, slot = "writer", "2026-07-26T20:00:00.000Z"
+        ledger = p.Ledger(writer)
+        claim = p.make_claim(slot, "A" * 64, writer, ledger.head)
+        ledger.claim(claim, writer, ledger.head)
+        bodies = {"CG_TOP250": universe(), "BN_FUT_EXCHANGE_INFO": b'{"bad":[]}'}
+        result = p.acquire_fixture_sources(ledger, claim, lambda source, _: (200, bodies[source], {}))
+        bad = result["__source_manifests__"][1]
+        self.assertEqual((bad["parse_status"], bad["qa_status"]), ("SCHEMA_FAILURE", "QA_NOT_RUN"))
+        self.assertIsNotNone(bad["error_record_sha256"])
+        self.assertEqual(len(result["__source_manifests__"]), len(p.SOURCE_ORDER))
+        required = {"claim_relative_path", "available_raw_count", "workflow_run_id", "job_id", "log_locator", "source_manifest_sha256s"}
+        self.assertTrue(required.issubset(result["__outcome__"]))
+
+    def test_snapshot_semantic_witness_and_contextual_provenance(self):
+        writer, slot = "writer", "2026-07-26T20:00:00.000Z"
+        ledger = p.Ledger(writer)
+        claim = p.make_claim(slot, "A" * 64, writer, ledger.head)
+        ledger.claim(claim, writer, ledger.head)
+        bodies = {
+            "CG_TOP250": universe(), "BN_FUT_EXCHANGE_INFO": b'{"symbols":[]}',
+            "BN_FUT_PREMIUM_INDEX": b"[]", "BN_FUT_BOOK_TICKER": b"[]",
+            "BN_MARGIN_ASSETS": b"[]", "BN_MARGIN_PAIRS": b"[]",
+            "BY_LINEAR_INSTRUMENTS": b'{"result":{"list":[],"nextPageCursor":""}}',
+            "BY_LINEAR_TICKERS": b'{"result":{"list":[]},"time":1720000000123}',
+            "BY_SPOT_INSTRUMENTS": b'{"result":{"list":[]}}',
+            "BY_MARGIN_BORROWABLE": b'{"result":{"list":[]}}',
+        }
+        parsed = p.acquire_fixture_sources(ledger, claim, lambda source, _: (200, bodies[source], {}))
+        snapshot = p.build_snapshot(bodies["CG_TOP250"], parsed, claim)
+        p.validate_snapshot(snapshot, claim, parsed["__source_manifests__"], {"writer_stop": False, "outcome_count": 1, "claim_before_request": True})
+        broken = json.loads(json.dumps(snapshot))
+        row = broken["assets"][0]["venues"][0]
+        row.update(mapping_status="MAPPED", exchange_symbol=None, perp_exists=False, funding_rate="0.1", bid_price="1", ask_price="2")
+        with self.assertRaises(p.PitError):
+            p.validate_snapshot(broken)
+
+    def test_schedule_and_branch_writer_are_frozen(self):
+        workflow = (Path(__file__).parent / ".github/workflows/pit-ledger.yml").read_text()
+        self.assertIn('cron: "2,32 * * * *"', workflow)
+        self.assertIn("ref: pit-ledger-v1", workflow)
+        self.assertIn("contents: write", workflow)
+        self.assertIn("HEAD:refs/heads/pit-ledger-v1", workflow)
+        p.acquisition_window("2026-07-26T20:00:00.000Z", datetime(2026, 7, 26, 20, 2, tzinfo=timezone.utc))
+        p.acquisition_window("2026-07-26T20:30:00.000Z", datetime(2026, 7, 26, 20, 32, tzinfo=timezone.utc))
+        for now in (datetime(2026, 7, 26, 19, 59, tzinfo=timezone.utc), datetime(2026, 7, 26, 20, 10, tzinfo=timezone.utc)):
+            with self.assertRaises(p.PitError):
+                p.acquisition_window("2026-07-26T20:00:00.000Z", now)
+
+    def test_real_local_bare_remote_e2e(self):
+        p.e2e_self_check()
 
     def test_self_check_subprocess_offline(self):
         env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")

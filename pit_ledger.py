@@ -10,7 +10,10 @@ import hashlib
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -131,18 +134,56 @@ SYMBOL_RE = re.compile(r"^[A-Za-z0-9]+$")
 DECIMAL_RE = re.compile(r"^-?(?:0|[1-9]\d*)(?:\.\d+)?$")
 FORBIDDEN_FIELDS = {"reason", "message", "detail", "diagnostic"}
 MAX_UNIX_MS = 253402300799999
+SHA256_RE = re.compile(r"^[0-9A-F]{64}$")
+IMPLEMENTATION_FILES = (".github/workflows/pit-ledger.yml", "pit_ledger.py")
 
 
 class PitError(ValueError):
     """Fail-closed contract violation."""
 
 
-def _validate_derived(value: Any) -> None:
+def _array_key(item: Any) -> bytes:
+    return json.dumps(item, ensure_ascii=True, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+
+
+def _validate_derived(value: Any, key: str | None = None) -> None:
     if value is None or isinstance(value, (bool, str)):
         return
     if isinstance(value, int) and not isinstance(value, bool):
         return
     if isinstance(value, list):
+        if key in {"missing_reasons", "reason_codes"}:
+            validate_ordered(value, MISSING_REASON_ORDER if key == "missing_reasons" else REASON_CODE_ORDER)
+        elif key in {"available_raw_sha256s", "source_manifest_sha256s", "source_raw_sha256s"}:
+            if value != sorted(set(value)) or any(not isinstance(x, str) or not SHA256_RE.fullmatch(x) for x in value):
+                raise PitError("NON_CANONICAL_HASH_ORDER")
+        elif key == "available_raw_relative_paths":
+            def raw_key(path: str) -> tuple[int, int]:
+                name = path.rsplit("/", 1)[-1]
+                matches = [(SOURCE_ORDER.index(source), name[len(source) + 1:].split(".", 1)[0]) for source in SOURCE_ORDER if name.startswith(source + "-")]
+                if len(matches) != 1 or not matches[0][1].isdigit():
+                    raise PitError("NON_CANONICAL_RAW_ORDER")
+                return matches[0][0], int(matches[0][1])
+            if any(not isinstance(x, str) for x in value) or value != sorted(value, key=raw_key):
+                raise PitError("NON_CANONICAL_RAW_ORDER")
+        elif key == "files":
+            if any(not isinstance(x, dict) or not isinstance(x.get("path"), str) for x in value) or value != sorted(value, key=lambda x: x["path"]):
+                raise PitError("NON_CANONICAL_FILE_ORDER")
+        elif key == "assets":
+            if [x.get("universe_rank") for x in value if isinstance(x, dict)] != list(range(1, len(value) + 1)):
+                raise PitError("NON_CANONICAL_ASSET_ORDER")
+        elif key == "venues":
+            if [x.get("venue") for x in value if isinstance(x, dict)] != list(VENUES):
+                raise PitError("NON_CANONICAL_VENUE_ORDER")
+        elif key in {"source_manifests", "raw_references"}:
+            def source_key(x: dict[str, Any]) -> tuple[int, int]:
+                return SOURCE_ORDER.index(x["source_id"]), x.get("page_ordinal", 0)
+            if any(not isinstance(x, dict) or x.get("source_id") not in SOURCE_ORDER for x in value) or value != sorted(value, key=source_key):
+                raise PitError("NON_CANONICAL_SOURCE_ORDER")
+        elif key is not None:
+            ordered_values = sorted(value, key=_array_key)
+            if value != ordered_values:
+                raise PitError("AMBIGUOUS_ARRAY_ORDER")
         for item in value:
             _validate_derived(item)
         return
@@ -150,13 +191,17 @@ def _validate_derived(value: Any) -> None:
         for key, item in value.items():
             if key in FORBIDDEN_FIELDS:
                 raise PitError("FREE_FORM_FIELD")
-            _validate_derived(item)
+            if key == "I_impl" or key.endswith("_sha256"):
+                if item is not None and (not isinstance(item, str) or not SHA256_RE.fullmatch(item)):
+                    raise PitError("INVALID_SHA256")
+            _validate_derived(item, key)
         return
     raise PitError("NON_CANONICAL_SCALAR")
 
 
 def canonical_bytes(value: Any) -> bytes:
     _validate_derived(value)
+    validate_normative(value)
     return (
         json.dumps(
             value,
@@ -173,6 +218,9 @@ def canonical_jsonl(records: Iterable[dict[str, Any]]) -> bytes:
     rows = list(records)
     if not rows:
         raise PitError("EMPTY_JSONL")
+    seq = [row.get("ledger_seq") for row in rows]
+    if any(type(item) is not int for item in seq) or seq != sorted(seq) or len(seq) != len(set(seq)):
+        raise PitError("NON_CANONICAL_LEDGER_ORDER")
     return b"".join(canonical_bytes(row) for row in rows)
 
 
@@ -202,16 +250,18 @@ def validate_ordered(values: Any, order: tuple[str, ...]) -> None:
         raise PitError("NON_CANONICAL_REASON_ORDER")
 
 
-def validate_normative(value: Any) -> None:
+def validate_normative(value: Any, key: str | None = None) -> None:
     if isinstance(value, list):
-        for item in value:
-            validate_normative(item)
+        _validate_derived(value, key)
         return
     if not isinstance(value, dict):
         return
     for key, item in value.items():
         if key in FORBIDDEN_FIELDS:
             raise PitError("FREE_FORM_FIELD")
+        if key == "I_impl" or key.endswith("_sha256"):
+            if item is not None and (not isinstance(item, str) or not SHA256_RE.fullmatch(item)):
+                raise PitError("INVALID_SHA256")
         if key in ENUMS and item not in ENUMS[key]:
             raise PitError("UNKNOWN_ENUM")
         if key == "http_status" and not (item is None or type(item) is int and 100 <= item <= 599):
@@ -224,9 +274,17 @@ def validate_normative(value: Any) -> None:
             validate_ordered(item, REASON_CODE_ORDER)
         if key.endswith("_utc") and item is not None:
             validate_utc(item)
-        validate_normative(item)
+        validate_normative(item, key)
     if "outcome_kind" in value and value.get("slot_status") != OUTCOME_STATUS[value["outcome_kind"]]:
         raise PitError("OUTCOME_STATUS_MISMATCH")
+    if (
+        value.get("mapping_status") == "MAPPED"
+        and value.get("perp_exists") is None
+        and value.get("qa_status") == "QA_FAILURE"
+        and value.get("source_id") in {"BN_FUT_EXCHANGE_INFO", "BY_LINEAR_INSTRUMENTS"}
+        and value.get("missing_reasons") != ["AMBIGUOUS_EXCHANGE_PRODUCT", "QA_FAILURE"]
+    ):
+        raise PitError("R3_01_ORACLE_MISMATCH")
 
 
 def validate_utc(value: str) -> None:
@@ -417,14 +475,22 @@ def parse_decimal_string(value: Any, positive: bool = False) -> Decimal:
     return number
 
 
-def spread_bps(bid: Any, ask: Any) -> str:
-    b = parse_decimal_string(bid, positive=True)
-    a = parse_decimal_string(ask, positive=True)
-    if b > a:
+def decimal_coefficient(value: Any) -> tuple[int, int]:
+    if not isinstance(value, str) or not DECIMAL_RE.fullmatch(value):
         raise PitError("SCHEMA_FAILURE")
-    scale = max(-b.as_tuple().exponent, -a.as_tuple().exponent, 0)
-    factor = Decimal(10) ** scale
-    B, A = int(b * factor), int(a * factor)
+    negative = value.startswith("-")
+    whole, dot, fraction = value.lstrip("-").partition(".")
+    coefficient = int(whole + fraction)
+    return (-coefficient if negative else coefficient), len(fraction) if dot else 0
+
+
+def spread_bps(bid: Any, ask: Any) -> str:
+    b, bs = decimal_coefficient(bid)
+    a, ass = decimal_coefficient(ask)
+    scale = max(bs, ass)
+    B, A = b * 10 ** (scale - bs), a * 10 ** (scale - ass)
+    if B <= 0 or A <= 0 or B > A:
+        raise PitError("SCHEMA_FAILURE")
     numerator, denominator = 20000 * (A - B), A + B
     q, remainder = divmod(numerator * 10**8, denominator)
     if 2 * remainder > denominator or 2 * remainder == denominator and q % 2:
@@ -525,12 +591,30 @@ def build_snapshot(
         by_spots = _rows(sources["BY_SPOT_INSTRUMENTS"], "result", "list")
         by_currencies = _rows(sources["BY_MARGIN_BORROWABLE"], "result", "list")
     except (KeyError, TypeError, PitError):
+        manifests = sources.get("__source_manifests__", [])
+        value = claim["value"]
+        raw_manifests = [item for item in manifests if item.get("raw_sha256")]
         return {
-            "outcome_kind": "SNAPSHOT_PARTIAL",
-            "reason_codes": ["SCHEMA_FAILURE"],
-            "slot_status": "PARTIAL",
+            "I_impl": value["I_impl"], "attempt_id": value["attempt_id"],
+            "available_raw_count": len(raw_manifests),
+            "available_raw_relative_paths": [item["raw_relative_path"] for item in raw_manifests],
+            "available_raw_sha256s": sorted({item["raw_sha256"] for item in raw_manifests}),
+            "claim_relative_path": claim["relative_path"], "claim_sha256": sha256(canonical_bytes(value)),
+            "contract_id": CONTRACT_ID, "epoch_id": EPOCH_ID,
+            "formal_slot_utc": value["formal_slot_utc"], "idempotency_key": value["idempotency_key"],
+            "job_id": value["job_id"], "log_locator": value["log_locator"], "log_sha256": sha256(b"fixture-log"),
+            "materialized_at_utc": value["claimed_at_utc"], "outcome_kind": "SNAPSHOT_PARTIAL",
+            "previous_ledger_head": value["expected_parent_before_claim"],
+            "reason_codes": ["SCHEMA_FAILURE"], "slot_status": "PARTIAL",
+            "source_manifest_sha256s": sorted({sha256(canonical_bytes(item)) for item in manifests}),
+            "workflow_run_id": value["workflow_run_id"],
         }
     decisions, assets, reason_codes = symbol_decisions(rows), [], []
+    source_manifests = sources.get("__source_manifests__", [])
+    raw_by_source: dict[str, list[str]] = {}
+    for manifest in source_manifests:
+        if manifest.get("raw_sha256"):
+            raw_by_source.setdefault(manifest["source_id"], []).append(manifest["raw_sha256"])
     for row, mapping in zip(rows, decisions):
         venue_rows = []
         for venue in VENUES:
@@ -557,9 +641,11 @@ def build_snapshot(
             if venue == "BINANCE_USDM":
                 product = perp_decision(venue, base, bn_instruments)
                 borrowable = borrowable_binance(base, bn_assets, bn_pairs)
+                used_sources = ["BN_FUT_EXCHANGE_INFO", "BN_MARGIN_ASSETS", "BN_MARGIN_PAIRS"]
             else:
                 product = perp_decision(venue, base, by_instruments)
                 borrowable = borrowable_bybit(base, by_currencies, by_spots)
+                used_sources = ["BY_LINEAR_INSTRUMENTS", "BY_SPOT_INSTRUMENTS", "BY_MARGIN_BORROWABLE"]
             empty["borrowable"] = borrowable
             empty["perp_exists"] = product["perp_exists"]
             empty["missing_reasons"] = list(product["missing_reasons"])
@@ -567,6 +653,7 @@ def build_snapshot(
                 empty["missing_reasons"] = ordered(empty["missing_reasons"] + ["SCHEMA_FAILURE"], MISSING_REASON_ORDER)
                 reason_codes.append("SCHEMA_FAILURE")
             if product["perp_exists"] is True:
+                used_sources += ["BN_FUT_PREMIUM_INDEX", "BN_FUT_BOOK_TICKER"] if venue == "BINANCE_USDM" else ["BY_LINEAR_TICKERS"]
                 try:
                     empty.update(
                         _ticker_record(
@@ -582,6 +669,7 @@ def build_snapshot(
                     reason_codes.append("SCHEMA_FAILURE")
             elif product["perp_exists"] is None:
                 reason_codes.append("QA_FAILURE" if "QA_FAILURE" in product["missing_reasons"] else "SCHEMA_FAILURE")
+            empty["source_raw_sha256s"] = sorted({item for source in used_sources for item in raw_by_source.get(source, [])})
             venue_rows.append(empty)
         assets.append(
             {
@@ -594,8 +682,13 @@ def build_snapshot(
     reason_codes = ordered(reason_codes, REASON_CODE_ORDER)
     kind = "SNAPSHOT_COMPLETE" if not reason_codes else "SNAPSHOT_PARTIAL"
     value = claim["value"]
+    manifests_hashes = [sha256(canonical_bytes(item)) for item in source_manifests]
+    raw_manifests = [item for item in source_manifests if item.get("raw_sha256")]
     snapshot = {
         "I_impl": value["I_impl"],
+        "available_raw_count": len(raw_manifests),
+        "available_raw_relative_paths": [item["raw_relative_path"] for item in raw_manifests],
+        "available_raw_sha256s": sorted({item["raw_sha256"] for item in raw_manifests}),
         "assets": assets,
         "attempt_id": value["attempt_id"],
         "attempt_started_at_utc": value["claimed_at_utc"],
@@ -610,17 +703,38 @@ def build_snapshot(
         "qa": {"qa_status": "QA_OK" if not reason_codes else "QA_FAILURE", "reason_codes": reason_codes},
         "reason_codes": reason_codes,
         "slot_status": OUTCOME_STATUS[kind],
+        "source_manifest_sha256s": sorted(set(manifests_hashes)),
         "universe_raw_sha256": sha256(raw_universe),
         "universe_source_id": "CG_TOP250",
+        "workflow_run_id": value["workflow_run_id"],
+        "job_id": value["job_id"],
+        "log_locator": value["log_locator"],
+        "log_sha256": sha256(b"fixture-log"),
+        "claim_relative_path": claim["relative_path"],
+        "previous_ledger_head": value["expected_parent_before_claim"],
     }
     validate_snapshot(snapshot)
     return snapshot
 
 
-def validate_snapshot(snapshot: dict[str, Any]) -> None:
+def validate_snapshot(
+    snapshot: dict[str, Any],
+    claim: dict[str, Any] | None = None,
+    source_manifests: list[dict[str, Any]] | None = None,
+    history: dict[str, Any] | None = None,
+) -> None:
     validate_normative(snapshot)
     if snapshot.get("contract_id") != CONTRACT_ID or snapshot.get("epoch_id") != EPOCH_ID:
         raise PitError("IDENTITY_MISMATCH")
+    if not SHA256_RE.fullmatch(snapshot.get("I_impl", "")):
+        raise PitError("IMPLEMENTATION_MISMATCH")
+    slot = snapshot.get("formal_slot_utc")
+    if snapshot.get("idempotency_key") != EPOCH_ID + "|" + str(slot):
+        raise PitError("IDEMPOTENCY_MISMATCH")
+    for key in ("attempt_started_at_utc", "capture_completed_at_utc", "materialized_at_utc", "formal_slot_utc"):
+        validate_utc(snapshot.get(key))
+    if snapshot.get("outcome_kind") not in {"SNAPSHOT_COMPLETE", "SNAPSHOT_PARTIAL", "SNAPSHOT_INVALID"}:
+        raise PitError("INVALID_SNAPSHOT_KIND")
     if set(snapshot.get("qa", {})) != {"qa_status", "reason_codes"}:
         raise PitError("INVALID_QA_SHAPE")
     if snapshot["qa"]["reason_codes"] != snapshot.get("reason_codes"):
@@ -633,10 +747,17 @@ def validate_snapshot(snapshot: dict[str, Any]) -> None:
     ids = [asset.get("coingecko_id") for asset in assets]
     if any(not isinstance(item, str) or not item for item in ids) or len(ids) != len(set(ids)):
         raise PitError("INVALID_IDS")
+    symbols = [asset.get("coingecko_symbol") for asset in assets]
+    valid_bases = [ascii_upper(x) for x in symbols if isinstance(x, str) and SYMBOL_RE.fullmatch(x)]
+    counts = {base: valid_bases.count(base) for base in set(valid_bases)}
+    all_venue_rows = 0
     for asset in assets:
+        if set(asset) != {"coingecko_id", "coingecko_symbol", "universe_rank", "venues"}:
+            raise PitError("INVALID_ASSET_SHAPE")
         venues = asset.get("venues")
         if not isinstance(venues, list) or [row.get("venue") for row in venues] != list(VENUES):
             raise PitError("INVALID_VENUES")
+        all_venue_rows += len(venues)
         for row in venues:
             required = {
                 "venue", "mapping_status", "exchange_symbol", "perp_exists",
@@ -644,8 +765,74 @@ def validate_snapshot(snapshot: dict[str, Any]) -> None:
                 "spread_bps", "mark_price", "index_price", "borrowable",
                 "missing_reasons", "source_raw_sha256s",
             }
-            if not required.issubset(row):
+            if set(row) != required:
                 raise PitError("MISSING_VENUE_FIELD")
+            symbol = asset["coingecko_symbol"]
+            if not isinstance(symbol, str) or not SYMBOL_RE.fullmatch(symbol):
+                expected_mapping, expected_reason = "UNMAPPABLE", ["INVALID_SYMBOL_FORMAT"]
+            elif counts[ascii_upper(symbol)] > 1:
+                expected_mapping, expected_reason = "AMBIGUOUS", ["AMBIGUOUS_SYMBOL"]
+            else:
+                expected_mapping, expected_reason = "MAPPED", None
+            if row["mapping_status"] != expected_mapping:
+                raise PitError("MAPPING_RELATION")
+            prices = ("funding_rate", "funding_observed_at_utc", "bid_price", "ask_price", "spread_bps", "mark_price", "index_price")
+            if expected_mapping != "MAPPED":
+                if row["exchange_symbol"] is not None or row["perp_exists"] is not None or row["borrowable"] is not None:
+                    raise PitError("MAPPING_RELATION")
+                if row["missing_reasons"] != expected_reason or any(row[field] is not None for field in prices):
+                    raise PitError("MAPPING_RELATION")
+            else:
+                candidate = ascii_upper(symbol) + "USDT"
+                if row["exchange_symbol"] != candidate:
+                    raise PitError("MAPPING_RELATION")
+                if row["perp_exists"] is False:
+                    if row["missing_reasons"] != ["NOT_APPLICABLE_NO_PERP"] or any(row[field] is not None for field in prices):
+                        raise PitError("PERP_RELATION")
+                elif row["perp_exists"] is True:
+                    if any(row[field] is None for field in prices):
+                        raise PitError("PERP_RELATION")
+                    if row["spread_bps"] != spread_bps(row["bid_price"], row["ask_price"]):
+                        raise PitError("SPREAD_RELATION")
+                    validate_utc(row["funding_observed_at_utc"])
+                    for field in ("funding_rate", "bid_price", "ask_price", "mark_price", "index_price"):
+                        parse_decimal_string(row[field], positive=field != "funding_rate")
+                    if row["missing_reasons"]:
+                        raise PitError("PERP_RELATION")
+                elif not row["missing_reasons"]:
+                    raise PitError("PERP_RELATION")
+                if row["borrowable"] is None and not any(code in row["missing_reasons"] for code in ("SOURCE_FAILURE", "PARSE_FAILURE", "SCHEMA_FAILURE", "QA_FAILURE")):
+                    raise PitError("BORROWABLE_RELATION")
+            for digest in row["source_raw_sha256s"]:
+                if digest not in snapshot.get("available_raw_sha256s", []):
+                    raise PitError("RAW_PROVENANCE")
+    if all_venue_rows != 500:
+        raise PitError("INVALID_VENUE_COUNT")
+    raw_paths = snapshot.get("available_raw_relative_paths")
+    raw_hashes = snapshot.get("available_raw_sha256s")
+    if snapshot.get("available_raw_count") != len(raw_paths or []) or not isinstance(raw_hashes, list):
+        raise PitError("RAW_PROVENANCE")
+    if claim is not None:
+        value = claim["value"]
+        expected = {
+            "I_impl": value["I_impl"], "formal_slot_utc": value["formal_slot_utc"],
+            "idempotency_key": value["idempotency_key"], "attempt_id": value["attempt_id"],
+            "workflow_run_id": value["workflow_run_id"], "job_id": value["job_id"],
+            "log_locator": value["log_locator"], "claim_relative_path": claim["relative_path"],
+            "claim_sha256": sha256(canonical_bytes(value)),
+        }
+        if any(snapshot.get(key) != val for key, val in expected.items()):
+            raise PitError("CLAIM_PROVENANCE")
+    if source_manifests is not None:
+        hashes = sorted({sha256(canonical_bytes(item)) for item in source_manifests})
+        if snapshot.get("source_manifest_sha256s") != hashes:
+            raise PitError("SOURCE_PROVENANCE")
+        pairs = [(item["raw_relative_path"], item["raw_sha256"]) for item in source_manifests if item.get("raw_sha256")]
+        if snapshot.get("available_raw_relative_paths") != [x[0] for x in pairs] or snapshot.get("available_raw_sha256s") != sorted({x[1] for x in pairs}):
+            raise PitError("RAW_PROVENANCE")
+    if history is not None:
+        if history.get("writer_stop") or history.get("outcome_count") != 1 or history.get("claim_before_request") is not True:
+            raise PitError("HISTORY_PROVENANCE")
 
 
 def validate_source_url(source_id: str, url: str) -> None:
@@ -662,8 +849,11 @@ def validate_source_url(source_id: str, url: str) -> None:
 def retry_request(
     send: Callable[[], tuple[int, bytes, dict[str, str]]],
     sleep: Callable[[float], None] = time.sleep,
+    before_attempt: Callable[[], None] | None = None,
 ) -> tuple[int, bytes, int]:
     for attempt in range(1, 4):
+        if before_attempt:
+            before_attempt()
         try:
             status, body, headers = send()
         except OSError:
@@ -702,6 +892,55 @@ def paginate_bybit(fetch: Callable[[str], bytes]) -> list[bytes]:
         url = URLS["BY_LINEAR_INSTRUMENTS"] + "&cursor=" + urllib.parse.quote(cursor, safe="")
 
 
+def validate_source_schema(source_id: str, body: Any) -> None:
+    if source_id == "CG_TOP250":
+        raise PitError("INTERNAL_RAW_SCHEMA_REQUIRED")
+    if source_id == "BN_FUT_EXCHANGE_INFO":
+        rows = _rows(body, "symbols")
+    elif source_id in {"BN_FUT_PREMIUM_INDEX", "BN_FUT_BOOK_TICKER", "BN_MARGIN_ASSETS", "BN_MARGIN_PAIRS"}:
+        rows = _rows(body)
+    elif source_id in {"BY_LINEAR_INSTRUMENTS", "BY_SPOT_INSTRUMENTS", "BY_MARGIN_BORROWABLE"}:
+        rows = _rows(body, "result", "list")
+        if source_id == "BY_LINEAR_INSTRUMENTS":
+            cursor = body["result"].get("nextPageCursor", "")
+            if not isinstance(cursor, str):
+                raise PitError("SCHEMA_FAILURE")
+    elif source_id == "BY_LINEAR_TICKERS":
+        rows = _rows(body, "result", "list")
+        utc_from_ms(body.get("time"))
+    else:
+        raise PitError("UNKNOWN_SOURCE")
+    if source_id == "BY_SPOT_INSTRUMENTS" and any(row.get("marginTrading") not in MARGIN_TRADING for row in rows):
+        raise PitError("SCHEMA_FAILURE")
+    if source_id == "BY_MARGIN_BORROWABLE" and any(type(row.get("borrowable")) is not bool for row in rows):
+        raise PitError("SCHEMA_FAILURE")
+    required: dict[str, dict[str, type]] = {
+        "BN_FUT_EXCHANGE_INFO": {"symbol": str, "baseAsset": str, "quoteAsset": str, "contractType": str, "status": str},
+        "BN_FUT_PREMIUM_INDEX": {"symbol": str, "lastFundingRate": str, "markPrice": str, "indexPrice": str, "time": int},
+        "BN_FUT_BOOK_TICKER": {"symbol": str, "bidPrice": str, "askPrice": str},
+        "BN_MARGIN_ASSETS": {"assetName": str, "isBorrowable": bool},
+        "BN_MARGIN_PAIRS": {"base": str, "quote": str, "isMarginTrade": bool, "isSellAllowed": bool},
+        "BY_LINEAR_INSTRUMENTS": {"symbol": str, "baseCoin": str, "quoteCoin": str, "settleCoin": str, "contractType": str, "status": str},
+        "BY_LINEAR_TICKERS": {"symbol": str, "fundingRate": str, "bid1Price": str, "ask1Price": str, "markPrice": str, "indexPrice": str},
+        "BY_SPOT_INSTRUMENTS": {"baseCoin": str, "quoteCoin": str, "marginTrading": str},
+        "BY_MARGIN_BORROWABLE": {"currency": str, "borrowable": bool},
+    }
+    for row in rows:
+        if any(type(row.get(field)) is not expected for field, expected in required[source_id].items()):
+            raise PitError("SCHEMA_FAILURE")
+
+
+def materialization_deadline(slot: str) -> datetime:
+    validate_utc(slot)
+    return datetime.strptime(slot, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc) + timedelta(minutes=15)
+
+
+def acquisition_window(slot: str, now: datetime) -> None:
+    start = datetime.strptime(slot, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc)
+    if now.tzinfo is None or not start <= now.astimezone(timezone.utc) < start + timedelta(minutes=10):
+        raise PitError("ACQUISITION_WINDOW_CLOSED")
+
+
 def artifact_path(relative: str) -> str:
     if (
         not isinstance(relative, str)
@@ -722,10 +961,24 @@ def ensure_impl_boundary(pinned: str, current: str, epoch_id: str, h0: str) -> N
         raise PitError("INVALID_EPOCH_BOUNDARY")
 
 
-def make_claim(slot: str, i_impl: str, writer: str, parent: str) -> dict[str, Any]:
+def claim_filesafe(slot: str) -> str:
+    validate_utc(slot)
+    return slot.replace("-", "").replace(":", "").replace(".", "")
+
+
+def make_claim(
+    slot: str,
+    i_impl: str,
+    writer: str,
+    parent: str,
+    claimed_at: str | None = None,
+    workflow_run_id: str = "fixture-run",
+    job_id: str = "fixture-job",
+    log_locator: str = "fixture-log",
+) -> dict[str, Any]:
     validate_utc(slot)
     key = EPOCH_ID + "|" + slot
-    filesafe = slot.replace("-", "").replace(":", "").replace(".", "")
+    filesafe = claim_filesafe(slot)
     return {
         "relative_path": artifact_path(PREFIX + "claims/" + filesafe + ".json"),
         "value": {
@@ -734,20 +987,27 @@ def make_claim(slot: str, i_impl: str, writer: str, parent: str) -> dict[str, An
             "attempt_ordinal": 1,
             "authorized_writer_identity": writer,
             "claim_status": "CLAIMED",
-            "claimed_at_utc": slot,
+            "claimed_at_utc": claimed_at or slot,
             "contract_id": CONTRACT_ID,
             "epoch_id": EPOCH_ID,
             "expected_parent_before_claim": parent,
             "formal_slot_utc": slot,
             "idempotency_key": key,
-            "job_id": "fixture-job",
-            "log_locator": "fixture-log",
-            "workflow_run_id": "fixture-run",
+            "job_id": job_id,
+            "log_locator": log_locator,
+            "workflow_run_id": workflow_run_id,
         },
     }
 
 
-def base_outcome(claim: dict[str, Any], kind: str, reason_codes: Iterable[str], raw: list[tuple[str, bytes]]) -> dict[str, Any]:
+def base_outcome(
+    claim: dict[str, Any],
+    kind: str,
+    reason_codes: Iterable[str],
+    raw: list[tuple[str, bytes]],
+    previous_head: str | None = None,
+    source_manifest_sha256s: Iterable[str] = (),
+) -> dict[str, Any]:
     value = claim["value"]
     raw_paths = [artifact_path(path) for path, _ in raw]
     raw_hashes = sorted({sha256(body) for _, body in raw})
@@ -768,10 +1028,10 @@ def base_outcome(claim: dict[str, Any], kind: str, reason_codes: Iterable[str], 
         "log_sha256": sha256(b"fixture-log"),
         "materialized_at_utc": value["formal_slot_utc"],
         "outcome_kind": kind,
-        "previous_ledger_head": value["expected_parent_before_claim"],
+        "previous_ledger_head": previous_head or value["expected_parent_before_claim"],
         "reason_codes": ordered(reason_codes, REASON_CODE_ORDER),
         "slot_status": OUTCOME_STATUS[kind],
-        "source_manifest_sha256s": [],
+        "source_manifest_sha256s": sorted(set(source_manifest_sha256s)),
         "workflow_run_id": value["workflow_run_id"],
     }
 
@@ -784,6 +1044,9 @@ class Ledger:
     outcomes: dict[str, dict[str, Any]] = field(default_factory=dict)
     raw: dict[str, list[tuple[str, bytes]]] = field(default_factory=dict)
     manifests: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    error_records: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    history_claim_keys: set[str] = field(default_factory=set)
+    published_bytes: dict[str, bytes] = field(default_factory=dict)
     events: list[str] = field(default_factory=list)
     writer_stop: bool = False
     writes_after_stop: int = 0
@@ -806,15 +1069,28 @@ class Ledger:
             return "DUPLICATE_NO_WRITE"
         if key in self.claims:
             return "CLAIM_HELD_NO_WRITE"
+        if claim["value"].get("authorized_writer_identity") != writer:
+            self.writer_stop = True
+            return "EPOCH_WRITER_STOP"
+        if claim["value"].get("expected_parent_before_claim") != expected_parent:
+            self.writer_stop = True
+            return "EPOCH_WRITER_STOP"
+        if key != EPOCH_ID + "|" + claim["value"].get("formal_slot_utc", ""):
+            self.writer_stop = True
+            return "EPOCH_WRITER_STOP"
         validate_normative(claim["value"])
+        data = canonical_bytes(claim["value"])
         self.claims[key] = claim
+        self.history_claim_keys.add(key)
+        self.published_bytes[claim["relative_path"]] = data
         self._write("claim:" + key)
         return "CLAIMED"
 
     def archive_raw(self, key: str, source_id: str, body: bytes) -> str:
         if key not in self.claims:
             raise PitError("CLAIM_REQUIRED_BEFORE_REQUEST")
-        path = artifact_path(PREFIX + "raw/" + source_id + "-" + str(len(self.raw.get(key, []))) + ".bin")
+        page = sum(path.rsplit("/", 1)[-1].startswith(source_id + "-") for path, _ in self.raw.get(key, []))
+        path = artifact_path(PREFIX + "raw/" + source_id + "-" + str(page) + ".bin")
         self.raw.setdefault(key, []).append((path, body))
         self._write("raw:" + key + ":" + source_id)
         return path
@@ -832,6 +1108,15 @@ class Ledger:
         self.manifests.setdefault(key, []).append(manifest)
         self._write("manifest:" + key + ":" + manifest["source_id"])
 
+    def publish_error(self, key: str, record: dict[str, Any]) -> tuple[str, str]:
+        validate_normative(record)
+        data = canonical_bytes(record)
+        path = artifact_path(PREFIX + "errors/" + record["source_id"] + "-" + str(record["page_ordinal"]) + ".json")
+        self.error_records.setdefault(key, []).append(record)
+        self.published_bytes[path] = data
+        self._write("error:" + key + ":" + record["source_id"])
+        return path, sha256(data)
+
     def publish_outcome(self, key: str, outcome: dict[str, Any], writer: str, expected_parent: str) -> str:
         if self.writer_stop or writer != self.authorized_writer:
             self.writer_stop = True
@@ -840,17 +1125,58 @@ class Ledger:
             return self.cas_reject(key, writer)
         if key in self.outcomes:
             return "DUPLICATE_NO_WRITE"
+        if outcome.get("idempotency_key") != key or outcome.get("formal_slot_utc") != key.split("|", 1)[1]:
+            self.writer_stop = True
+            return "EPOCH_WRITER_STOP"
+        claim = self.claims.get(key)
+        if claim:
+            if (
+                outcome.get("claim_relative_path") != claim["relative_path"]
+                or outcome.get("claim_sha256") != sha256(canonical_bytes(claim["value"]))
+                or outcome.get("attempt_id") != claim["value"]["attempt_id"]
+                or outcome.get("workflow_run_id") != claim["value"]["workflow_run_id"]
+                or outcome.get("job_id") != claim["value"]["job_id"]
+                or outcome.get("log_locator") != claim["value"]["log_locator"]
+            ):
+                self.writer_stop = True
+                return "EPOCH_WRITER_STOP"
+        if outcome.get("previous_ledger_head") != expected_parent:
+            self.writer_stop = True
+            return "EPOCH_WRITER_STOP"
         validate_normative(outcome)
         self.outcomes[key] = outcome
+        self.published_bytes[artifact_path(PREFIX + "outcomes/" + claim_filesafe(outcome["formal_slot_utc"]) + ".json")] = canonical_bytes(outcome)
         self._write("outcome:" + key)
         return "PUBLISHED_SLOT_OUTCOME"
 
-    def cas_reject(self, key: str, observed_writer: str, observed_key: str | None = None) -> str:
+    def cas_reject(
+        self,
+        key: str,
+        observed_writer: str,
+        observed_key: str | None = None,
+        observed_parent: str | None = None,
+        observed_bytes: bytes | None = None,
+        observed_sha256: str | None = None,
+        observed_delta: Iterable[str] | None = None,
+    ) -> str:
         if observed_writer != self.authorized_writer or observed_key not in {None, key}:
             self.writer_stop = True
             return "EPOCH_WRITER_STOP"
         if key in self.outcomes:
-            validate_canonical(canonical_bytes(self.outcomes[key]))
+            outcome = self.outcomes[key]
+            expected = canonical_bytes(outcome)
+            path = artifact_path(PREFIX + "outcomes/" + claim_filesafe(outcome["formal_slot_utc"]) + ".json")
+            if observed_bytes is not None and observed_bytes != expected:
+                self.writer_stop = True
+            if observed_sha256 is not None and observed_sha256 != sha256(expected):
+                self.writer_stop = True
+            if observed_parent is not None and observed_parent != outcome["previous_ledger_head"]:
+                self.writer_stop = True
+            if observed_delta is not None and list(observed_delta) != [path]:
+                self.writer_stop = True
+            validate_canonical(expected)
+            if self.writer_stop:
+                return "EPOCH_WRITER_STOP"
             return "DUPLICATE_NO_WRITE"
         if key in self.claims:
             return "CLAIM_HELD_NO_WRITE"
@@ -867,9 +1193,18 @@ class Ledger:
             self.writer_stop = True
         return "EPOCH_WRITER_STOP" if self.writer_stop else "OK"
 
-    def recover(self, claim: dict[str, Any], writer: str, expected_parent: str) -> str:
+    def recover(
+        self,
+        claim: dict[str, Any],
+        writer: str,
+        expected_parent: str,
+        now: datetime,
+        history_complete: bool = True,
+    ) -> str:
         key = claim["value"]["idempotency_key"]
         if self.writer_stop:
+            return "EPOCH_WRITER_STOP"
+        if not history_complete or now.astimezone(timezone.utc) < materialization_deadline(claim["value"]["formal_slot_utc"]):
             return "EPOCH_WRITER_STOP"
         if key in self.outcomes:
             return "DUPLICATE_NO_WRITE"
@@ -878,9 +1213,12 @@ class Ledger:
         if key in self.claims:
             raw = self.raw.get(key, [])
             reasons = ["ATTEMPT_ABORTED"] + ([] if raw else ["NO_RAW_DURABLY_PUBLISHED"])
-            outcome = base_outcome(self.claims[key], "ABORTED_ATTEMPT", reasons, raw)
+            outcome = base_outcome(self.claims[key], "ABORTED_ATTEMPT", reasons, raw, self.head)
         else:
-            outcome = base_outcome(claim, "GAP_NO_RUN", ["NO_CLAIM_BEFORE_DEADLINE"], [])
+            if key in self.history_claim_keys:
+                self.writer_stop = True
+                return "EPOCH_WRITER_STOP"
+            outcome = base_outcome(claim, "GAP_NO_RUN", ["NO_CLAIM_BEFORE_DEADLINE"], [], self.head)
         return self.publish_outcome(key, outcome, writer, self.head)
 
 
@@ -894,7 +1232,7 @@ def fixture_vertical_slice(raw: bytes, parser: Callable[[bytes], Any]) -> tuple[
     ledger.events.append("request:" + key)
     ledger.archive_raw(key, "CG_TOP250", raw)
     parsed = ledger.parse_after_raw(key, parser)
-    outcome = base_outcome(claim, "SNAPSHOT_COMPLETE", [], ledger.raw[key])
+    outcome = base_outcome(claim, "SNAPSHOT_COMPLETE", [], ledger.raw[key], ledger.head)
     if ledger.publish_outcome(key, outcome, writer, ledger.head) != "PUBLISHED_SLOT_OUTCOME":
         raise PitError("OUTCOME_NOT_PUBLISHED")
     return ledger, {"parsed": parsed, "outcome": outcome}
@@ -904,64 +1242,168 @@ def acquire_fixture_sources(
     ledger: Ledger,
     claim: dict[str, Any],
     fetch: Callable[[str, str], tuple[int, bytes, dict[str, str]]],
+    clock: Callable[[], datetime] | None = None,
+    durable_publish: Callable[[str, bytes, bool], None] | None = None,
+    sleep: Callable[[float], None] = lambda _: None,
 ) -> dict[str, Any]:
-    """Offline producer: frozen order, raw-before-parse, manifest-before-next."""
+    """Frozen producer path; fixture/live transports differ only at ``fetch``."""
     key = claim["value"]["idempotency_key"]
     if key not in ledger.claims:
         raise PitError("CLAIM_REQUIRED_BEFORE_REQUEST")
+    slot = claim["value"]["formal_slot_utc"]
+    fixed = datetime.strptime(slot, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc) + timedelta(minutes=1)
+    clock = clock or (lambda: fixed)
     parsed: dict[str, Any] = {}
+    manifest_hashes: list[str] = []
+    failure: str | None = None
+    page_cursors: set[str] = set()
+
+    def not_run(source_id: str) -> None:
+        manifest = {
+            "I_impl": claim["value"]["I_impl"], "attempt_count": 0,
+            "auth_class": "READ_ONLY_MARKET_DATA" if source_id in READ_ONLY_SOURCES else "PUBLIC",
+            "canonical_url_without_secret": URLS[source_id], "error_record_relative_path": None,
+            "error_record_sha256": None, "fetched_at_utc": None, "http_status": None,
+            "method": "GET", "page_ordinal": 0, "parse_status": "PARSE_NOT_RUN",
+            "qa_status": "QA_NOT_RUN", "raw_bytes": None, "raw_relative_path": None,
+            "raw_sha256": None, "requested_at_utc": None, "server_time_utc": None,
+            "source_id": source_id, "source_status": "SOURCE_NOT_RUN",
+        }
+        ledger.manifests.setdefault(key, []).append(manifest)
+        if durable_publish:
+            relative = artifact_path(PREFIX + "source-manifests/" + source_id + "-0.json")
+            durable_publish(relative, canonical_bytes(manifest), False)
+        manifest_hashes.append(sha256(canonical_bytes(manifest)))
+
     for source_id in SOURCE_ORDER:
-        pages, url = [], URLS[source_id]
-        while True:
+        if failure is not None:
+            not_run(source_id)
+            continue
+        pages: list[Any] = []
+
+        def capture_page(url: str) -> bytes:
+            nonlocal failure
+            page_ordinal = len(pages)
+            acquisition_window(slot, clock())
             validate_source_url(source_id, url)
             ledger.events.append("request:" + key + ":" + source_id)
-            status, raw, attempts = retry_request(lambda: fetch(source_id, url), lambda _: None)
-            ledger.archive_raw(key, source_id, raw)
             try:
-                body = ledger.parse_after_raw(key, json.loads)
-                parse_status, qa_status = "PARSE_OK", "QA_OK"
-            except (json.JSONDecodeError, TypeError):
-                body, parse_status, qa_status = None, "PARSE_FAILURE", "QA_NOT_RUN"
+                status, raw, attempts = retry_request(
+                    lambda: fetch(source_id, url), sleep, lambda: acquisition_window(slot, clock())
+                )
+            except PitError:
+                status, raw, attempts = None, None, 3
+                body, code = None, "SOURCE_FAILURE"
+            else:
+                acquisition_window(slot, clock())
+                ledger.archive_raw(key, source_id, raw)
+                if durable_publish:
+                    durable_publish(ledger.raw[key][-1][0], raw, True)
+                try:
+                    body = ledger.parse_after_raw(key, lambda data: json.loads(data, parse_constant=_reject_constant))
+                except (json.JSONDecodeError, TypeError, UnicodeDecodeError, PitError):
+                    body, code = None, "PARSE_FAILURE"
+                else:
+                    try:
+                        if source_id == "CG_TOP250":
+                            _, gap = parse_universe(raw)
+                            if gap is not None:
+                                raise PitError(gap["reason_codes"][0])
+                        else:
+                            validate_source_schema(source_id, body)
+                            if source_id == "BY_LINEAR_INSTRUMENTS":
+                                cursor = body["result"].get("nextPageCursor", "")
+                                if cursor and cursor in page_cursors:
+                                    raise PitError("SCHEMA_FAILURE")
+                                if cursor:
+                                    page_cursors.add(cursor)
+                    except PitError as exc:
+                        code = str(exc) if str(exc) in {"SCHEMA_FAILURE", "DERIVATION_FAILURE", "QA_FAILURE"} else "SCHEMA_FAILURE"
+                    else:
+                        code = None
+            error_path = error_hash = None
+            if code:
+                record = {
+                    "error_class": code, "log_locator": claim["value"]["log_locator"],
+                    "log_sha256": sha256(b"fixture-log"), "page_ordinal": page_ordinal,
+                    "raw_relative_path": ledger.raw.get(key, [(None, b"")])[-1][0] if raw is not None else None,
+                    "raw_sha256": sha256(raw) if raw is not None else None, "source_id": source_id,
+                }
+                error_path, error_hash = ledger.publish_error(key, record)
+                if durable_publish:
+                    durable_publish(error_path, canonical_bytes(record), False)
+                failure = code
+            raw_path = ledger.raw[key][-1][0] if raw is not None else None
             manifest = {
-                "I_impl": claim["value"]["I_impl"],
-                "attempt_count": attempts,
+                "I_impl": claim["value"]["I_impl"], "attempt_count": attempts,
                 "auth_class": "READ_ONLY_MARKET_DATA" if source_id in READ_ONLY_SOURCES else "PUBLIC",
-                "canonical_url_without_secret": url,
-                "error_record_relative_path": None,
-                "error_record_sha256": None,
-                "fetched_at_utc": claim["value"]["claimed_at_utc"],
-                "http_status": status,
-                "method": "GET",
-                "page_ordinal": len(pages),
-                "parse_status": parse_status,
-                "qa_status": qa_status,
-                "raw_bytes": len(raw),
-                "raw_relative_path": ledger.raw[key][-1][0],
-                "raw_sha256": sha256(raw),
-                "requested_at_utc": claim["value"]["claimed_at_utc"],
-                "server_time_utc": None,
-                "source_id": source_id,
-                "source_status": "SOURCE_OK",
+                "canonical_url_without_secret": url, "error_record_relative_path": error_path,
+                "error_record_sha256": error_hash, "fetched_at_utc": claim["value"]["claimed_at_utc"] if raw is not None else None,
+                "http_status": status, "method": "GET", "page_ordinal": page_ordinal,
+                "parse_status": "PARSE_NOT_RUN" if code == "SOURCE_FAILURE" else ("PARSE_FAILURE" if code == "PARSE_FAILURE" else ("SCHEMA_FAILURE" if code else "PARSE_OK")),
+                "qa_status": "QA_OK" if code is None else "QA_NOT_RUN",
+                "raw_bytes": len(raw) if raw is not None else None, "raw_relative_path": raw_path,
+                "raw_sha256": sha256(raw) if raw is not None else None,
+                "requested_at_utc": claim["value"]["claimed_at_utc"], "server_time_utc": None,
+                "source_id": source_id, "source_status": "SOURCE_FAILURE" if code == "SOURCE_FAILURE" else "SOURCE_OK",
             }
             ledger.publish_manifest(key, manifest)
+            if durable_publish:
+                relative = artifact_path(PREFIX + "source-manifests/" + source_id + "-" + str(page_ordinal) + ".json")
+                durable_publish(relative, canonical_bytes(manifest), False)
+            manifest_hashes.append(sha256(canonical_bytes(manifest)))
             pages.append(body)
-            if source_id != "BY_LINEAR_INSTRUMENTS":
-                parsed[source_id] = body
-                break
-            try:
-                cursor = body["result"].get("nextPageCursor", "")
-            except (KeyError, AttributeError, TypeError):
-                raise PitError("SCHEMA_FAILURE")
-            if not cursor:
+            if code:
+                raise PitError(code)
+            return raw
+
+        try:
+            if source_id == "BY_LINEAR_INSTRUMENTS":
+                paginate_bybit(capture_page)
                 parsed[source_id] = pages
-                break
-            if not isinstance(cursor, str):
-                raise PitError("SCHEMA_FAILURE")
-            url = URLS[source_id] + "&cursor=" + urllib.parse.quote(cursor, safe="")
+            else:
+                capture_page(URLS[source_id])
+                parsed[source_id] = pages[0]
+        except PitError as exc:
+            if failure is None:
+                failure = str(exc) if str(exc) in {"SOURCE_FAILURE", "PARSE_FAILURE", "SCHEMA_FAILURE", "DERIVATION_FAILURE", "QA_FAILURE"} else "SCHEMA_FAILURE"
+                last = ledger.manifests[key][-1]
+                record = {
+                    "error_class": failure, "log_locator": claim["value"]["log_locator"],
+                    "log_sha256": sha256(b"fixture-log"), "page_ordinal": last["page_ordinal"],
+                    "raw_relative_path": last["raw_relative_path"], "raw_sha256": last["raw_sha256"],
+                    "source_id": source_id,
+                }
+                error_path, error_hash = ledger.publish_error(key, record)
+                if durable_publish:
+                    durable_publish(error_path, canonical_bytes(record), False)
+                last.update(error_record_relative_path=error_path, error_record_sha256=error_hash, parse_status="SCHEMA_FAILURE", qa_status="QA_NOT_RUN")
+                manifest_hashes[-1] = sha256(canonical_bytes(last))
+            continue
+    parsed["__source_manifests__"] = list(ledger.manifests[key])
+    parsed["__error_records__"] = list(ledger.error_records.get(key, []))
+    if failure:
+        kind = "GAP_UNIVERSE" if "CG_TOP250" not in parsed else "SNAPSHOT_PARTIAL"
+        parsed["__outcome__"] = base_outcome(claim, kind, [failure], ledger.raw.get(key, []), ledger.head, manifest_hashes)
     return parsed
 
 
-def require_live_authorization(env: dict[str, str]) -> None:
+def implementation_manifest(root: os.PathLike[str] | str = ".") -> bytes:
+    base = os.fspath(root)
+    files = []
+    for relative in IMPLEMENTATION_FILES:
+        path = os.path.join(base, *relative.split("/"))
+        with open(path, "rb") as handle:
+            data = handle.read()
+        files.append({"bytes": len(data), "path": relative, "sha256": sha256(data)})
+    return canonical_bytes({"files": files})
+
+
+def current_i_impl(root: os.PathLike[str] | str = ".") -> str:
+    return sha256(implementation_manifest(root))
+
+
+def require_live_authorization(env: dict[str, str], root: os.PathLike[str] | str = ".") -> None:
     required = {
         "PIT_ACTIVATION_APPROVED": "YES",
         "PIT_TARGET_WRITE_APPROVED": "YES",
@@ -976,7 +1418,167 @@ def require_live_authorization(env: dict[str, str]) -> None:
         value = env.get(name, "")
         if not value or exact and value != exact:
             raise PitError("STOP_PERMISSION_REQUIRED")
-    ensure_impl_boundary(env["PIT_I_IMPL"], env["PIT_I_IMPL_CURRENT"], EPOCH_ID, env["PIT_H0"])
+    if not SHA256_RE.fullmatch(env["PIT_I_IMPL"]):
+        raise PitError("STOP_PERMISSION_REQUIRED")
+    ensure_impl_boundary(env["PIT_I_IMPL"], current_i_impl(root), EPOCH_ID, env["PIT_H0"])
+
+
+class GitWriter:
+    """Exact-parent, no-force writer for the isolated PIT branch."""
+
+    def __init__(self, repo: os.PathLike[str] | str, writer: str, branch: str = "pit-ledger-v1"):
+        self.repo, self.writer, self.branch = os.fspath(repo), writer, branch
+
+    def git(self, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+        if any(arg in {"--force", "-f", "--force-with-lease"} for arg in args):
+            raise PitError("FORCE_FORBIDDEN")
+        result = subprocess.run(["git", *args], cwd=self.repo, capture_output=True, text=True, check=False)
+        if check and result.returncode:
+            raise PitError("GIT_FAILURE")
+        return result
+
+    def remote_head(self) -> str:
+        result = self.git("ls-remote", "--heads", "origin", f"refs/heads/{self.branch}")
+        lines = result.stdout.strip().splitlines()
+        if len(lines) != 1 or not re.fullmatch(r"[0-9a-f]{40}", lines[0].split()[0]):
+            raise PitError("REMOTE_HEAD_UNPROVEN")
+        return lines[0].split()[0]
+
+    def read_at(self, head: str, relative: str) -> bytes | None:
+        artifact_path(relative)
+        result = subprocess.run(["git", "show", f"{head}:{relative}"], cwd=self.repo, capture_output=True, check=False)
+        return result.stdout if result.returncode == 0 else None
+
+    def verify_history(self, h0: str, head: str) -> None:
+        self.git("fetch", "--quiet", "origin", f"refs/heads/{self.branch}")
+        if self.git("merge-base", "--is-ancestor", h0, head, check=False).returncode:
+            raise PitError("EPOCH_WRITER_STOP")
+        for line in self.git("rev-list", "--reverse", "--parents", f"{h0}..{head}").stdout.splitlines():
+            parts = line.split()
+            if len(parts) != 2:
+                raise PitError("EPOCH_WRITER_STOP")
+            commit = parts[0]
+            author = self.git("show", "-s", "--format=%an <%ae>", commit).stdout.strip()
+            changes = [line.split("\t", 1) for line in self.git("diff-tree", "--no-commit-id", "--name-status", "-r", commit).stdout.splitlines()]
+            paths = [parts[1] for parts in changes if len(parts) == 2]
+            if author != self.writer or not paths or any(parts[0] != "A" for parts in changes) or any(artifact_path(path) != path for path in paths):
+                raise PitError("EPOCH_WRITER_STOP")
+
+    def history_absent(self, h0: str, head: str, relative: str) -> bool:
+        artifact_path(relative)
+        if self.read_at(head, relative) is not None:
+            return False
+        return not self.git("log", "--format=%H", f"{h0}..{head}", "--", relative).stdout.strip()
+
+    def publish(self, relative: str, data: bytes, expected_parent: str, message: str, raw: bool = False) -> tuple[str, str]:
+        artifact_path(relative)
+        if not raw:
+            validate_canonical(data)
+        self.git("fetch", "--quiet", "origin", f"refs/heads/{self.branch}")
+        if self.remote_head() != expected_parent or self.git("status", "--porcelain").stdout:
+            return "CAS_REJECTED", self.remote_head()
+        if self.read_at(expected_parent, relative) is not None:
+            return "CAS_REJECTED", expected_parent
+        self.git("checkout", "--quiet", "--detach", expected_parent)
+        target = os.path.join(self.repo, *relative.split("/"))
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "wb") as handle:
+            handle.write(data)
+        self.git("add", "--", relative)
+        if self.git("diff", "--cached", "--name-only").stdout.splitlines() != [relative]:
+            raise PitError("SCOPE_CHANGE")
+        self.git("commit", "--quiet", "-m", message)
+        commit = self.git("rev-parse", "HEAD").stdout.strip()
+        parents = self.git("show", "-s", "--format=%P", commit).stdout.split()
+        if parents != [expected_parent]:
+            raise PitError("EPOCH_WRITER_STOP")
+        pushed = self.git("push", "origin", f"HEAD:refs/heads/{self.branch}", check=False)
+        if pushed.returncode:
+            self.git("fetch", "--quiet", "origin", f"refs/heads/{self.branch}")
+            return "CAS_REJECTED", self.remote_head()
+        if self.remote_head() != commit or self.read_at(commit, relative) != data:
+            raise PitError("WRITE_UNCONFIRMED")
+        return "PUBLISHED", commit
+
+    def verify_duplicate(self, key: str, expected_parent: str | None, head: str) -> str:
+        slot = key.split("|", 1)[1]
+        claim_path = artifact_path(PREFIX + "claims/" + claim_filesafe(slot) + ".json")
+        outcome_path = artifact_path(PREFIX + "outcomes/" + claim_filesafe(slot) + ".json")
+        claim_data, outcome_data = self.read_at(head, claim_path), self.read_at(head, outcome_path)
+        if claim_data is None:
+            return "EPOCH_WRITER_STOP"
+        claim = validate_canonical(claim_data)
+        claim_commits = self.git("log", "--format=%H", "--diff-filter=A", head, "--", claim_path).stdout.splitlines()
+        if len(claim_commits) != 1:
+            return "EPOCH_WRITER_STOP"
+        claim_commit = claim_commits[0]
+        claim_parents = self.git("show", "-s", "--format=%P", claim_commit).stdout.split()
+        claim_delta = self.git("diff-tree", "--no-commit-id", "--name-only", "-r", claim_commit).stdout.splitlines()
+        claim_author = self.git("show", "-s", "--format=%an <%ae>", claim_commit).stdout.strip()
+        if (
+            claim.get("idempotency_key") != key
+            or claim.get("authorized_writer_identity") != self.writer
+            or len(claim_parents) != 1
+            or claim.get("expected_parent_before_claim") != claim_parents[0]
+            or expected_parent is not None and claim_parents[0] != expected_parent
+            or claim_delta != [claim_path]
+            or claim_author != self.writer
+        ):
+            return "EPOCH_WRITER_STOP"
+        if outcome_data is None:
+            return "CLAIM_HELD_NO_WRITE"
+        outcome = validate_canonical(outcome_data)
+        outcome_commits = self.git("log", "--format=%H", "--diff-filter=A", head, "--", outcome_path).stdout.splitlines()
+        if len(outcome_commits) != 1:
+            return "EPOCH_WRITER_STOP"
+        outcome_commit = outcome_commits[0]
+        outcome_parents = self.git("show", "-s", "--format=%P", outcome_commit).stdout.split()
+        outcome_delta = self.git("diff-tree", "--no-commit-id", "--name-only", "-r", outcome_commit).stdout.splitlines()
+        outcome_author = self.git("show", "-s", "--format=%an <%ae>", outcome_commit).stdout.strip()
+        if (
+            outcome.get("idempotency_key") != key
+            or outcome.get("claim_relative_path") != claim_path
+            or outcome.get("claim_sha256") != sha256(claim_data)
+            or outcome.get("attempt_id") != claim.get("attempt_id")
+            or len(outcome_parents) != 1
+            or outcome.get("previous_ledger_head") != outcome_parents[0]
+            or outcome_delta != [outcome_path]
+            or outcome_author != self.writer
+        ):
+            return "EPOCH_WRITER_STOP"
+        paths = outcome.get("available_raw_relative_paths")
+        hashes = outcome.get("available_raw_sha256s")
+        if outcome.get("available_raw_count") != len(paths or []) or not isinstance(hashes, list):
+            return "EPOCH_WRITER_STOP"
+        for path in paths:
+            data = self.read_at(head, path)
+            if data is None or sha256(data) not in hashes:
+                return "EPOCH_WRITER_STOP"
+        manifest_paths = [
+            path for path in self.git("ls-tree", "-r", "--name-only", head, "--", PREFIX + "source-manifests/").stdout.splitlines()
+            if path.startswith(PREFIX + "source-manifests/")
+        ]
+        manifest_hashes = sorted({sha256(self.read_at(head, path) or b"") for path in manifest_paths})
+        if outcome.get("source_manifest_sha256s") != manifest_hashes:
+            return "EPOCH_WRITER_STOP"
+        return "DUPLICATE_NO_WRITE"
+
+    def recover_gap(self, h0: str, claim: dict[str, Any], now: datetime) -> tuple[str, str]:
+        slot, key = claim["value"]["formal_slot_utc"], claim["value"]["idempotency_key"]
+        head = self.remote_head()
+        if now.astimezone(timezone.utc) < materialization_deadline(slot):
+            return "EPOCH_WRITER_STOP", head
+        self.verify_history(h0, head)
+        claim_path = claim["relative_path"]
+        outcome_path = artifact_path(PREFIX + "outcomes/" + claim_filesafe(slot) + ".json")
+        if not self.history_absent(h0, head, claim_path):
+            return self.verify_duplicate(key, claim["value"]["expected_parent_before_claim"], head), head
+        if self.read_at(head, outcome_path) is not None:
+            return "EPOCH_WRITER_STOP", head
+        outcome = base_outcome(claim, "GAP_NO_RUN", ["NO_CLAIM_BEFORE_DEADLINE"], [], head)
+        outcome["claim_relative_path"] = None
+        outcome["claim_sha256"] = None
+        return self.publish(outcome_path, canonical_bytes(outcome), head, "PIT recovery GAP_NO_RUN")
 
 
 def _live_send(source_id: str, url: str, api_key: str) -> tuple[int, bytes, dict[str, str]]:
@@ -995,8 +1597,60 @@ def _live_send(source_id: str, url: str, api_key: str) -> tuple[int, bytes, dict
 
 
 def live_capture() -> None:
-    require_live_authorization(dict(os.environ))
-    raise PitError("STOP_PERMISSION_REQUIRED")  # activation also requires audited H_stage/I_impl decision
+    env = dict(os.environ)
+    root = os.path.dirname(os.path.abspath(__file__))
+    require_live_authorization(env, root)
+    now = datetime.now(timezone.utc)
+    minute = 30 if now.minute >= 30 else 0
+    slot_dt = now.replace(minute=minute, second=0, microsecond=0)
+    slot = slot_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    acquisition_window(slot, now)
+    writer_id = env["PIT_AUTHORIZED_WRITER"]
+    writer = GitWriter(root, writer_id)
+    head = writer.remote_head()
+    writer.verify_history(env["PIT_H0"], head)
+    claim = make_claim(
+        slot, env["PIT_I_IMPL"], writer_id, head,
+        now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z",
+        env.get("GITHUB_RUN_ID", "local-run"), env.get("GITHUB_JOB", "capture"),
+        env.get("GITHUB_SERVER_URL", "") + "/" + env.get("GITHUB_REPOSITORY", "") + "/actions/runs/" + env.get("GITHUB_RUN_ID", "local-run"),
+    )
+    key, claim_path = claim["value"]["idempotency_key"], claim["relative_path"]
+    if not writer.history_absent(env["PIT_H0"], head, claim_path):
+        print(writer.verify_duplicate(key, None, head))
+        return
+    status, head = writer.publish(claim_path, canonical_bytes(claim["value"]), head, "PIT claim")
+    if status != "PUBLISHED":
+        print(writer.verify_duplicate(key, claim["value"]["expected_parent_before_claim"], head))
+        return
+    ledger = Ledger(writer_id, head=head)
+    ledger.claims[key] = claim
+    ledger.history_claim_keys.add(key)
+
+    def durable(relative: str, data: bytes, raw: bool) -> None:
+        nonlocal head
+        status, new_head = writer.publish(relative, data, head, "PIT artifact", raw)
+        if status != "PUBLISHED":
+            raise PitError(writer.verify_duplicate(key, head, new_head))
+        head = new_head
+
+    parsed = acquire_fixture_sources(
+        ledger, claim,
+        lambda source_id, url: _live_send(source_id, url, env["BINANCE_MARKET_DATA_API_KEY"]),
+        lambda: datetime.now(timezone.utc), durable, time.sleep,
+    )
+    if "__outcome__" in parsed:
+        outcome = parsed["__outcome__"]
+    else:
+        outcome = build_snapshot(parsed["CG_TOP250"].encode() if isinstance(parsed["CG_TOP250"], str) else ledger.raw[key][0][1], parsed, claim)
+    outcome["previous_ledger_head"] = head
+    if "assets" in outcome:
+        validate_snapshot(outcome, claim, parsed["__source_manifests__"], {"writer_stop": False, "outcome_count": 1, "claim_before_request": True})
+    outcome_path = artifact_path(PREFIX + "outcomes/" + claim_filesafe(slot) + ".json")
+    status, _ = writer.publish(outcome_path, canonical_bytes(outcome), head, "PIT outcome")
+    if status != "PUBLISHED":
+        raise PitError("EPOCH_WRITER_STOP")
+    print("PUBLISHED_SLOT_OUTCOME")
 
 
 def oracle_objects() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
@@ -1025,6 +1679,8 @@ def self_check() -> None:
         assert (len(data), sha256(data)) == oracle
         assert validate_canonical(data) == value
     assert spread_bps("99", "100") == "100.50251256"
+    assert spread_bps("397999999999900000000000000000000", "402000000000100000000000000000001") == "100.00000001"
+    assert SHA256_RE.fullmatch(current_i_impl(os.path.dirname(os.path.abspath(__file__))))
     try:
         require_live_authorization({})
     except PitError as exc:
@@ -1034,6 +1690,78 @@ def self_check() -> None:
     print("SELF_CHECK PASS")
 
 
+def e2e_self_check() -> None:
+    writer_identity = "PIT Ledger Writer <pit@example.invalid>"
+    with tempfile.TemporaryDirectory(prefix="pit-ledger-e2e-") as temp:
+        remote, seed = os.path.join(temp, "remote.git"), os.path.join(temp, "seed")
+
+        def run(cwd: str, *args: str) -> str:
+            result = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, check=False)
+            if result.returncode:
+                raise AssertionError(result.stderr)
+            return result.stdout.strip()
+
+        os.mkdir(remote)
+        run(remote, "init", "--bare", "--quiet")
+        os.mkdir(seed)
+        run(seed, "init", "--quiet")
+        run(seed, "config", "user.name", "seed")
+        run(seed, "config", "user.email", "seed@example.invalid")
+        run(seed, "commit", "--allow-empty", "--quiet", "-m", "H0")
+        run(seed, "branch", "-M", "pit-ledger-v1")
+        run(seed, "remote", "add", "origin", remote)
+        run(seed, "push", "--quiet", "-u", "origin", "pit-ledger-v1")
+        h0 = run(seed, "rev-parse", "HEAD")
+        clones = []
+        for name in ("a", "b"):
+            path = os.path.join(temp, name)
+            run(temp, "clone", "--quiet", "--branch", "pit-ledger-v1", remote, path)
+            run(path, "config", "user.name", "PIT Ledger Writer")
+            run(path, "config", "user.email", "pit@example.invalid")
+            clones.append(path)
+        a, b = GitWriter(clones[0], writer_identity), GitWriter(clones[1], writer_identity)
+        slot = "2026-07-26T20:00:00.000Z"
+        claim = make_claim(slot, "A" * 64, writer_identity, h0)
+        key = claim["value"]["idempotency_key"]
+        status, claim_head = a.publish(claim["relative_path"], canonical_bytes(claim["value"]), h0, "claim")
+        assert status == "PUBLISHED"
+        status, raced_head = b.publish(claim["relative_path"], canonical_bytes(claim["value"]), h0, "racing claim")
+        assert status == "CAS_REJECTED" and raced_head == claim_head
+        loser_path = artifact_path(PREFIX + "race-loser.json")
+        loser_target = os.path.join(clones[1], *loser_path.split("/"))
+        os.makedirs(os.path.dirname(loser_target), exist_ok=True)
+        with open(loser_target, "wb") as handle:
+            handle.write(canonical_bytes({}))
+        b.git("add", "--", loser_path)
+        b.git("commit", "--quiet", "-m", "losing non-fast-forward")
+        rejected = b.git("push", "origin", f"HEAD:refs/heads/{b.branch}", check=False)
+        assert rejected.returncode != 0 and b.remote_head() == claim_head
+        assert b.verify_duplicate(key, h0, raced_head) == "CLAIM_HELD_NO_WRITE"
+        outcome = base_outcome(claim, "SNAPSHOT_COMPLETE", [], [], claim_head)
+        outcome_path = artifact_path(PREFIX + "outcomes/" + claim_filesafe(slot) + ".json")
+        status, outcome_head = a.publish(outcome_path, canonical_bytes(outcome), claim_head, "outcome")
+        assert status == "PUBLISHED"
+        status, raced_head = b.publish(outcome_path, canonical_bytes(outcome), claim_head, "racing outcome")
+        assert status == "CAS_REJECTED" and raced_head == outcome_head
+        assert b.verify_duplicate(key, h0, raced_head) == "DUPLICATE_NO_WRITE"
+        assert b.read_at(raced_head, outcome_path) == canonical_bytes(outcome)
+        future = make_claim("2099-01-01T00:00:00.000Z", "A" * 64, writer_identity, raced_head)
+        before = a.remote_head()
+        assert a.recover_gap(h0, future, datetime(2099, 1, 1, 0, 14, tzinfo=timezone.utc))[0] == "EPOCH_WRITER_STOP"
+        assert a.remote_head() == before
+        old = make_claim("2020-01-01T00:00:00.000Z", "A" * 64, writer_identity, before)
+        status, recovery_head = a.recover_gap(h0, old, datetime(2020, 1, 1, 0, 16, tzinfo=timezone.utc))
+        assert status == "PUBLISHED" and recovery_head != before
+        a.verify_history(h0, recovery_head)
+        try:
+            a.git("push", "--force", "origin", "HEAD")
+        except PitError as exc:
+            assert str(exc) == "FORCE_FORBIDDEN"
+        else:
+            raise AssertionError("force was not forbidden")
+    print("E2E_SELF_CHECK PASS")
+
+
 def main(argv: list[str]) -> int:
     if argv == ["self-check"]:
         self_check()
@@ -1041,7 +1769,10 @@ def main(argv: list[str]) -> int:
     if argv in (["workflow"], ["capture"]):
         live_capture()
         return 0
-    print("usage: pit_ledger.py self-check|workflow", file=sys.stderr)
+    if argv == ["e2e-self-check"]:
+        e2e_self_check()
+        return 0
+    print("usage: pit_ledger.py self-check|e2e-self-check|workflow", file=sys.stderr)
     return 2
 
 

@@ -7,13 +7,15 @@ Checks:
 ```text
 python -m unittest -v test_pit_ledger.py
 python pit_ledger.py self-check
+python pit_ledger.py e2e-self-check
 git diff --check
 ```
 
-The workflow is only a `schedule`/`workflow_dispatch` wrapper. It fails closed
+The workflow is a thin `schedule` wrapper installed on the default branch. It
+checks out and writes only `pit-ledger-v1` and fails closed
 before network access unless every separately governed activation, target-write,
 secret, writer, implementation, epoch and permission boundary is present.
 
-This root commit is not an activation: no live download, collector-v4 read,
+This child commit is not an activation: no live download, collector-v4 read,
 target mutation, remote branch, push, dispatch, `H0`, `S0`, killtest or trading
 is authorized.
