@@ -1,6 +1,7 @@
 import json
 import os
 import subprocess
+import tempfile
 import unittest
 from datetime import datetime, timezone
 from decimal import Decimal, localcontext
@@ -42,9 +43,9 @@ def bybit_instrument(base="BTC"):
     }
 
 
-def complete_snapshot_fixture(bybit_page_count=1, binance_case=None):
-    writer, slot = "writer", "2026-07-26T20:00:00.000Z"
-    ledger = p.Ledger(writer)
+def complete_snapshot_fixture(bybit_page_count=1, binance_case=None, failed_source=None, parent="H0", writer="writer"):
+    slot = "2026-07-26T20:00:00.000Z"
+    ledger = p.Ledger(writer, head=parent)
     claim = p.make_claim(slot, "A" * 64, writer, ledger.head)
     ledger.claim(claim, writer, ledger.head)
     bodies = {
@@ -59,12 +60,15 @@ def complete_snapshot_fixture(bybit_page_count=1, binance_case=None):
         bodies["BN_FUT_EXCHANGE_INFO"] = json.dumps(
             {"symbols": [binance_instrument("X0")]}, separators=(",", ":")
         ).encode()
+    if binance_case in {"borrow_failure", "no_perp_borrow_failure"}:
+        bodies.update(
+            BN_MARGIN_ASSETS=b'[{"assetName":"X0","isBorrowable":true},{"assetName":"X0","isBorrowable":true}]',
+            BN_MARGIN_PAIRS=b'[{"base":"X0","isMarginTrade":true,"isSellAllowed":true,"quote":"USDT"}]',
+        )
     if binance_case == "borrow_failure":
         bodies.update(
             BN_FUT_PREMIUM_INDEX=b'[{"indexPrice":"100","lastFundingRate":"0.001","markPrice":"100","symbol":"X0USDT","time":1720000000123}]',
             BN_FUT_BOOK_TICKER=b'[{"askPrice":"100","bidPrice":"99","symbol":"X0USDT"}]',
-            BN_MARGIN_ASSETS=b'[{"assetName":"X0","isBorrowable":true},{"assetName":"X0","isBorrowable":true}]',
-            BN_MARGIN_PAIRS=b'[{"base":"X0","isMarginTrade":true,"isSellAllowed":true,"quote":"USDT"}]',
         )
     bybit_pages = [
         b'{"result":{"list":[],"nextPageCursor":"next"}}',
@@ -72,12 +76,14 @@ def complete_snapshot_fixture(bybit_page_count=1, binance_case=None):
     ] if bybit_page_count == 2 else [b'{"result":{"list":[],"nextPageCursor":""}}']
 
     def fetch(source_id, url):
+        if source_id == failed_source:
+            return 500, b"", {}
         if source_id == "BY_LINEAR_INSTRUMENTS":
             return 200, bybit_pages[1 if "&cursor=" in url else 0], {}
         return 200, bodies[source_id], {}
 
     parsed = p.acquire_fixture_sources(ledger, claim, fetch)
-    snapshot = p.build_snapshot(bodies["CG_TOP250"], parsed, claim)
+    snapshot = parsed.get("__outcome__") or p.build_snapshot(bodies["CG_TOP250"], parsed, claim)
     manifests = parsed["__source_manifests__"]
     manifest_map = {
         p.slot_artifact(
@@ -682,6 +688,200 @@ class PermissionAndStaticTests(unittest.TestCase):
             with self.subTest(case=case):
                 claim, manifests, snapshot, context = complete_snapshot_fixture(binance_case=case)
                 p.validate_snapshot(snapshot, claim, manifests, context, False, "A" * 64)
+
+    def test_post_cg_failure_each_later_source_has_full_validated_snapshot_and_missing_assets_never_publishes(self):
+        for source_id in p.SOURCE_ORDER[1:]:
+            with self.subTest(source_id=source_id):
+                claim, manifests, snapshot, context = complete_snapshot_fixture(failed_source=source_id)
+                self.assertEqual(
+                    (snapshot["outcome_kind"], snapshot["slot_status"], snapshot["reason_codes"]),
+                    ("SNAPSHOT_PARTIAL", "PARTIAL", ["SOURCE_FAILURE"]),
+                )
+                self.assertEqual(len(snapshot["assets"]), 250)
+                self.assertEqual(snapshot["qa"], {"qa_status": "QA_FAILURE", "reason_codes": ["SOURCE_FAILURE"]})
+                self.assertEqual(
+                    (
+                        snapshot["attempt_started_at_utc"],
+                        snapshot["capture_completed_at_utc"],
+                        snapshot["materialized_at_utc"],
+                    ),
+                    (claim["value"]["claimed_at_utc"],) * 3,
+                )
+                p.validate_snapshot(snapshot, claim, manifests, context, False, "A" * 64)
+
+        writer_identity = "PIT Ledger Writer <pit@example.invalid>"
+        with tempfile.TemporaryDirectory(prefix="pit-ledger-missing-assets-") as temp:
+            remote, repo = Path(temp, "remote.git"), Path(temp, "repo")
+
+            def git(cwd, *args):
+                result = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, check=False)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                return result.stdout.strip()
+
+            remote.mkdir()
+            git(remote, "init", "--bare", "--quiet")
+            repo.mkdir()
+            git(repo, "init", "--quiet")
+            git(repo, "config", "user.name", "seed")
+            git(repo, "config", "user.email", "seed@example.invalid")
+            git(repo, "commit", "--allow-empty", "--quiet", "-m", "H0")
+            git(repo, "branch", "-M", "pit-ledger-v1")
+            git(repo, "remote", "add", "origin", str(remote))
+            git(repo, "push", "--quiet", "-u", "origin", "pit-ledger-v1")
+            h0 = git(repo, "rev-parse", "HEAD")
+            git(repo, "config", "user.name", "PIT Ledger Writer")
+            git(repo, "config", "user.email", "pit@example.invalid")
+            writer = p.GitWriter(repo, writer_identity)
+            claim, manifests, snapshot, context = complete_snapshot_fixture(
+                failed_source="BY_MARGIN_BORROWABLE", parent=h0, writer=writer_identity,
+            )
+            status, head = writer.publish(
+                claim["relative_path"], p.canonical_bytes(claim["value"]), h0, "claim",
+            )
+            self.assertEqual(status, "PUBLISHED")
+            files = {
+                path: (raw, True) for path, raw in context.raw.items()
+            }
+            files.update({
+                path: (p.canonical_bytes(manifest), False)
+                for path, manifest in context.source_manifests.items()
+            })
+            failed = next(item for item in manifests if item["source_id"] == "BY_MARGIN_BORROWABLE")
+            error_record = {
+                "error_class": "SOURCE_FAILURE",
+                "log_locator": claim["value"]["log_locator"],
+                "log_sha256": p.sha256(p.run_log_bytes(claim)),
+                "page_ordinal": 0,
+                "raw_relative_path": None,
+                "raw_sha256": None,
+                "source_id": "BY_MARGIN_BORROWABLE",
+            }
+            self.assertEqual(p.sha256(p.canonical_bytes(error_record)), failed["error_record_sha256"])
+            files[failed["error_record_relative_path"]] = (p.canonical_bytes(error_record), False)
+            files[claim["value"]["log_locator"]] = (p.run_log_bytes(claim), True)
+            status, head = writer.publish_many(files, head, "fixture artifacts")
+            self.assertEqual(status, "PUBLISHED")
+
+            stripped = dict(snapshot)
+            stripped.pop("assets")
+            before = writer.remote_head()
+            with self.assertRaisesRegex(p.PitError, "INVALID_ASSET_COUNT"):
+                writer.publish_terminal(
+                    h0, claim, stripped["outcome_kind"], stripped["reason_codes"],
+                    True, "A" * 64, stripped,
+                )
+            self.assertEqual(writer.remote_head(), before)
+            self.assertIsNone(writer.read_at(before, p.PREFIX + "outcomes/" + p.claim_filesafe(claim["value"]["formal_slot_utc"]) + ".json"))
+
+            context = writer.context(h0, before, claim["value"]["idempotency_key"])
+            manifests = sorted(
+                context.source_manifests.values(),
+                key=lambda item: (p.SOURCE_ORDER.index(item["source_id"]), item["page_ordinal"]),
+            )
+            raw_pairs = [
+                (item["raw_relative_path"], item["raw_sha256"])
+                for item in manifests if item.get("raw_sha256")
+            ]
+            malformed = dict(stripped)
+            malformed.update(
+                previous_ledger_head=before,
+                log_locator=claim["value"]["log_locator"],
+                log_sha256=p.sha256(p.run_log_bytes(claim)),
+                source_manifest_sha256s=sorted({p.sha256(p.canonical_bytes(item)) for item in manifests}),
+                available_raw_count=len(raw_pairs),
+                available_raw_relative_paths=[item[0] for item in raw_pairs],
+                available_raw_sha256s=sorted({item[1] for item in raw_pairs}),
+            )
+            slot = claim["value"]["formal_slot_utc"]
+            outcome_path = p.PREFIX + "outcomes/" + p.claim_filesafe(slot) + ".json"
+            outcome_bytes = p.canonical_bytes(malformed)
+            slot_manifest = {
+                "claim_sha256": malformed["claim_sha256"],
+                "error_record_sha256s": sorted({
+                    item["error_record_sha256"] for item in manifests if item.get("error_record_sha256")
+                }),
+                "formal_slot_utc": slot,
+                "idempotency_key": claim["value"]["idempotency_key"],
+                "ledger_seq": 1,
+                "outcome_relative_path": outcome_path,
+                "outcome_sha256": p.sha256(outcome_bytes),
+                "raw_sha256s": malformed["available_raw_sha256s"],
+                "source_config_sha256": p.sha256(p.canonical_bytes(p.URLS)),
+                "source_manifest_sha256s": malformed["source_manifest_sha256s"],
+            }
+            slot_manifest_path = p.slot_root(slot) + "slot-manifest.json"
+            slot_manifest_bytes = p.canonical_bytes(slot_manifest)
+            record = {
+                "formal_slot_utc": slot,
+                "idempotency_key": claim["value"]["idempotency_key"],
+                "ledger_seq": 1,
+                "outcome_relative_path": outcome_path,
+                "outcome_sha256": p.sha256(outcome_bytes),
+                "slot_manifest_relative_path": slot_manifest_path,
+                "slot_manifest_sha256": p.sha256(slot_manifest_bytes),
+            }
+            index = p.canonical_bytes(record)
+            checkpoint_path = p.PREFIX + "checkpoints/" + p.claim_filesafe(slot) + ".json"
+            checkpoint = p.canonical_bytes({
+                "formal_slot_utc": slot,
+                "ledger_index_sha256": p.sha256(index),
+                "ledger_seq": 1,
+                "terminal_parent": before,
+            })
+            status, bad_head = writer.publish_many(
+                {
+                    p.LEDGER_INDEX_PATH: (index, True),
+                    checkpoint_path: (checkpoint, False),
+                    outcome_path: (outcome_bytes, False),
+                    slot_manifest_path: (slot_manifest_bytes, False),
+                },
+                before,
+                "malformed fixture terminal",
+            )
+            self.assertEqual(status, "PUBLISHED")
+            calls = []
+            validate_snapshot = p.validate_snapshot
+            def observed_validation(*args, **kwargs):
+                calls.append(True)
+                return validate_snapshot(*args, **kwargs)
+            p.validate_snapshot = observed_validation
+            try:
+                duplicate_status = writer.verify_duplicate(
+                    claim["value"]["idempotency_key"], h0, bad_head, h0, "A" * 64,
+                )
+            finally:
+                p.validate_snapshot = validate_snapshot
+            self.assertEqual(duplicate_status, "EPOCH_WRITER_STOP")
+            self.assertEqual(calls, [True])
+
+    def test_no_perp_with_independent_borrow_failure_is_contextually_valid_only_when_consistent(self):
+        claim, manifests, snapshot, context = complete_snapshot_fixture(
+            binance_case="no_perp_borrow_failure",
+        )
+        row = snapshot["assets"][0]["venues"][0]
+        self.assertIs(row["perp_exists"], False)
+        self.assertIsNone(row["borrowable"])
+        self.assertTrue(all(row[field] is None for field in (
+            "funding_rate", "funding_observed_at_utc", "bid_price", "ask_price",
+            "spread_bps", "mark_price", "index_price",
+        )))
+        self.assertEqual(row["missing_reasons"], ["NOT_APPLICABLE_NO_PERP", "SCHEMA_FAILURE"])
+        self.assertEqual(snapshot["reason_codes"], ["SCHEMA_FAILURE"])
+        p.validate_snapshot(snapshot, claim, manifests, context, False, "A" * 64)
+
+        for change in ("order", "borrowable", "snapshot_reason"):
+            with self.subTest(change=change):
+                inconsistent = json.loads(json.dumps(snapshot))
+                target = inconsistent["assets"][0]["venues"][0]
+                if change == "order":
+                    target["missing_reasons"].reverse()
+                elif change == "borrowable":
+                    target["borrowable"] = False
+                else:
+                    inconsistent["reason_codes"] = ["SOURCE_FAILURE"]
+                    inconsistent["qa"]["reason_codes"] = ["SOURCE_FAILURE"]
+                with self.assertRaises(p.PitError):
+                    p.validate_snapshot(inconsistent)
 
     def test_missing_any_source_or_page_rejected(self):
         claim, manifests, snapshot, context = complete_snapshot_fixture(2)

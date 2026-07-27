@@ -603,38 +603,62 @@ def build_snapshot(
     rows, gap = parse_universe(raw_universe)
     if gap is not None:
         return gap
-    try:
-        bn_instruments = _rows(sources["BN_FUT_EXCHANGE_INFO"], "symbols")
-        by_instruments = []
-        for page in sources["BY_LINEAR_INSTRUMENTS"]:
-            by_instruments.extend(_rows(page, "result", "list"))
-        bn_premium = _rows(sources["BN_FUT_PREMIUM_INDEX"])
-        bn_books = _rows(sources["BN_FUT_BOOK_TICKER"])
-        bn_assets = _rows(sources["BN_MARGIN_ASSETS"])
-        bn_pairs = _rows(sources["BN_MARGIN_PAIRS"])
-        by_spots = _rows(sources["BY_SPOT_INSTRUMENTS"], "result", "list")
-        by_currencies = _rows(sources["BY_MARGIN_BORROWABLE"], "result", "list")
-    except (KeyError, TypeError, PitError):
-        manifests = sources.get("__source_manifests__", [])
-        value = claim["value"]
-        raw_manifests = [item for item in manifests if item.get("raw_sha256")]
-        return {
-            "I_impl": value["I_impl"], "attempt_id": value["attempt_id"],
-            "available_raw_count": len(raw_manifests),
-            "available_raw_relative_paths": [item["raw_relative_path"] for item in raw_manifests],
-            "available_raw_sha256s": sorted({item["raw_sha256"] for item in raw_manifests}),
-            "claim_relative_path": claim["relative_path"], "claim_sha256": sha256(canonical_bytes(value)),
-            "contract_id": CONTRACT_ID, "epoch_id": EPOCH_ID,
-            "formal_slot_utc": value["formal_slot_utc"], "idempotency_key": value["idempotency_key"],
-            "job_id": value["job_id"], "log_locator": value["log_locator"], "log_sha256": sha256(run_log_bytes(claim)),
-            "materialized_at_utc": value["claimed_at_utc"], "outcome_kind": "SNAPSHOT_PARTIAL",
-            "previous_ledger_head": value["expected_parent_before_claim"],
-            "reason_codes": ["SCHEMA_FAILURE"], "slot_status": "PARTIAL",
-            "source_manifest_sha256s": sorted({sha256(canonical_bytes(item)) for item in manifests}),
-            "workflow_run_id": value["workflow_run_id"],
-        }
-    decisions, assets, reason_codes = symbol_decisions(rows), [], []
     source_manifests = sources.get("__source_manifests__", [])
+    source_errors: dict[str, str] = {}
+    for manifest in source_manifests:
+        statuses = (
+            manifest.get("source_status"),
+            manifest.get("parse_status"),
+            manifest.get("qa_status"),
+        )
+        code = {
+            ("SOURCE_FAILURE", "PARSE_NOT_RUN", "QA_NOT_RUN"): "SOURCE_FAILURE",
+            ("SOURCE_OK", "PARSE_FAILURE", "QA_NOT_RUN"): "PARSE_FAILURE",
+            ("SOURCE_OK", "SCHEMA_FAILURE", "QA_NOT_RUN"): "SCHEMA_FAILURE",
+            ("SOURCE_OK", "PARSE_OK", "DERIVATION_FAILURE"): "DERIVATION_FAILURE",
+            ("SOURCE_OK", "PARSE_OK", "QA_FAILURE"): "QA_FAILURE",
+        }.get(statuses)
+        if code is not None:
+            source_errors[manifest["source_id"]] = code
+    primary_error = next(
+        (source_errors[source_id] for source_id in SOURCE_ORDER if source_id in source_errors),
+        None,
+    )
+    for source_id in SOURCE_ORDER[1:]:
+        if source_id not in sources:
+            source_errors.setdefault(source_id, primary_error or "SCHEMA_FAILURE")
+
+    def source_rows(source_id: str, *path: str) -> list[dict[str, Any]] | None:
+        nonlocal primary_error
+        if source_id in source_errors:
+            return None
+        try:
+            return _rows(sources[source_id], *path)
+        except (KeyError, TypeError, PitError):
+            source_errors[source_id] = "SCHEMA_FAILURE"
+            primary_error = primary_error or "SCHEMA_FAILURE"
+            return None
+
+    bn_instruments = source_rows("BN_FUT_EXCHANGE_INFO", "symbols")
+    bn_premium = source_rows("BN_FUT_PREMIUM_INDEX")
+    bn_books = source_rows("BN_FUT_BOOK_TICKER")
+    bn_assets = source_rows("BN_MARGIN_ASSETS")
+    bn_pairs = source_rows("BN_MARGIN_PAIRS")
+    by_spots = source_rows("BY_SPOT_INSTRUMENTS", "result", "list")
+    by_currencies = source_rows("BY_MARGIN_BORROWABLE", "result", "list")
+    by_instruments = None
+    if "BY_LINEAR_INSTRUMENTS" not in source_errors:
+        try:
+            by_instruments = []
+            for page in sources["BY_LINEAR_INSTRUMENTS"]:
+                by_instruments.extend(_rows(page, "result", "list"))
+        except (KeyError, TypeError, PitError):
+            source_errors["BY_LINEAR_INSTRUMENTS"] = "SCHEMA_FAILURE"
+            primary_error = primary_error or "SCHEMA_FAILURE"
+            by_instruments = None
+
+    decisions, assets = symbol_decisions(rows), []
+    reason_codes = list(source_errors.values())
     raw_by_source: dict[str, list[str]] = {}
     for manifest in source_manifests:
         if manifest.get("raw_sha256"):
@@ -663,36 +687,55 @@ def build_snapshot(
                 continue
             base, candidate = mapping["base"], mapping["exchange_symbol"]
             if venue == "BINANCE_USDM":
-                product = perp_decision(venue, base, bn_instruments)
-                borrowable = borrowable_binance(base, bn_assets, bn_pairs)
+                product_reason = source_errors.get("BN_FUT_EXCHANGE_INFO")
+                product = (
+                    {"perp_exists": None, "missing_reasons": [product_reason]}
+                    if product_reason else perp_decision(venue, base, bn_instruments)
+                )
+                borrow_reason = source_errors.get("BN_MARGIN_ASSETS") or source_errors.get("BN_MARGIN_PAIRS")
+                borrowable = None if borrow_reason else borrowable_binance(base, bn_assets, bn_pairs)
                 used_sources = ["BN_FUT_EXCHANGE_INFO", "BN_MARGIN_ASSETS", "BN_MARGIN_PAIRS"]
+                ticker_reason = source_errors.get("BN_FUT_PREMIUM_INDEX") or source_errors.get("BN_FUT_BOOK_TICKER")
             else:
-                product = perp_decision(venue, base, by_instruments)
-                borrowable = borrowable_bybit(base, by_currencies, by_spots)
+                product_reason = source_errors.get("BY_LINEAR_INSTRUMENTS")
+                product = (
+                    {"perp_exists": None, "missing_reasons": [product_reason]}
+                    if product_reason else perp_decision(venue, base, by_instruments)
+                )
+                borrow_reason = source_errors.get("BY_SPOT_INSTRUMENTS") or source_errors.get("BY_MARGIN_BORROWABLE")
+                borrowable = None if borrow_reason else borrowable_bybit(base, by_currencies, by_spots)
                 used_sources = ["BY_LINEAR_INSTRUMENTS", "BY_SPOT_INSTRUMENTS", "BY_MARGIN_BORROWABLE"]
+                ticker_reason = source_errors.get("BY_LINEAR_TICKERS")
             empty["borrowable"] = borrowable
             empty["perp_exists"] = product["perp_exists"]
             empty["missing_reasons"] = list(product["missing_reasons"])
-            if borrowable is None and product["perp_exists"] is not None:
-                empty["missing_reasons"] = ordered(empty["missing_reasons"] + ["SCHEMA_FAILURE"], MISSING_REASON_ORDER)
-                reason_codes.append("SCHEMA_FAILURE")
+            if borrowable is None:
+                borrow_reason = borrow_reason or "SCHEMA_FAILURE"
+                empty["missing_reasons"] = ordered(empty["missing_reasons"] + [borrow_reason], MISSING_REASON_ORDER)
+                reason_codes.append(borrow_reason)
             if product["perp_exists"] is True:
                 used_sources += ["BN_FUT_PREMIUM_INDEX", "BN_FUT_BOOK_TICKER"] if venue == "BINANCE_USDM" else ["BY_LINEAR_TICKERS"]
-                try:
-                    empty.update(
-                        _ticker_record(
-                            venue,
-                            candidate,
-                            bn_premium,
-                            bn_books,
-                            sources["BY_LINEAR_TICKERS"],
+                if ticker_reason:
+                    empty["missing_reasons"] = ordered(empty["missing_reasons"] + [ticker_reason], MISSING_REASON_ORDER)
+                    reason_codes.append(ticker_reason)
+                else:
+                    try:
+                        empty.update(
+                            _ticker_record(
+                                venue,
+                                candidate,
+                                bn_premium,
+                                bn_books,
+                                sources["BY_LINEAR_TICKERS"],
+                            )
                         )
-                    )
-                except PitError:
-                    empty["missing_reasons"] = ordered(empty["missing_reasons"] + ["SCHEMA_FAILURE"], MISSING_REASON_ORDER)
-                    reason_codes.append("SCHEMA_FAILURE")
+                    except (KeyError, PitError):
+                        empty["missing_reasons"] = ordered(empty["missing_reasons"] + ["SCHEMA_FAILURE"], MISSING_REASON_ORDER)
+                        reason_codes.append("SCHEMA_FAILURE")
             elif product["perp_exists"] is None:
-                reason_codes.append("QA_FAILURE" if "QA_FAILURE" in product["missing_reasons"] else "SCHEMA_FAILURE")
+                reason_codes.extend(
+                    code for code in product["missing_reasons"] if code in REASON_CODE_ORDER
+                )
             empty["source_raw_sha256s"] = sorted({item for source in used_sources for item in raw_by_source.get(source, [])})
             venue_rows.append(empty)
         assets.append(
@@ -821,13 +864,29 @@ def validate_snapshot(
                 candidate = ascii_upper(symbol) + "USDT"
                 if row["exchange_symbol"] != candidate:
                     raise PitError("MAPPING_RELATION")
+                source_errors = {"SOURCE_FAILURE", "PARSE_FAILURE", "SCHEMA_FAILURE", "DERIVATION_FAILURE", "QA_FAILURE"}
                 if row["perp_exists"] is False:
-                    if row["missing_reasons"] != ["NOT_APPLICABLE_NO_PERP"] or any(row[field] is not None for field in prices):
+                    error_reasons = set(row["missing_reasons"]) - {"NOT_APPLICABLE_NO_PERP"}
+                    error_state = (
+                        bool(error_reasons)
+                        and error_reasons <= source_errors
+                        and error_reasons <= set(reasons)
+                    )
+                    expected_reasons = ordered(
+                        ["NOT_APPLICABLE_NO_PERP"] + list(error_reasons),
+                        MISSING_REASON_ORDER,
+                    )
+                    if (
+                        any(row[field] is not None for field in prices)
+                        or row["borrowable"] is None and (
+                            not error_state or row["missing_reasons"] != expected_reasons
+                        )
+                        or row["borrowable"] is not None and row["missing_reasons"] != ["NOT_APPLICABLE_NO_PERP"]
+                    ):
                         raise PitError("PERP_RELATION")
                 elif row["perp_exists"] is True:
                     market_complete = all(row[field] is not None for field in prices)
                     market_missing = all(row[field] is None for field in prices)
-                    source_errors = {"SOURCE_FAILURE", "PARSE_FAILURE", "SCHEMA_FAILURE", "DERIVATION_FAILURE", "QA_FAILURE"}
                     error_reasons = set(row["missing_reasons"])
                     error_state = bool(error_reasons) and error_reasons <= source_errors and error_reasons <= set(reasons)
                     if not market_complete and not (market_missing and error_state):
@@ -903,7 +962,13 @@ def validate_snapshot(
                     if row["perp_exists"] is True:
                         required_sources += ["BY_LINEAR_TICKERS"]
                     expected_hashes = sorted({digest for source in required_sources for digest in source_hashes.get(source, [])})
-                if row["source_raw_sha256s"] != expected_hashes or row["mapping_status"] == "MAPPED" and not expected_hashes:
+                has_source_error = any(reason in {
+                    "SOURCE_FAILURE", "PARSE_FAILURE", "SCHEMA_FAILURE", "DERIVATION_FAILURE", "QA_FAILURE",
+                } for reason in row["missing_reasons"])
+                if (
+                    row["source_raw_sha256s"] != expected_hashes
+                    or row["mapping_status"] == "MAPPED" and not expected_hashes and not has_source_error
+                ):
                     raise PitError("VENUE_RAW_PROVENANCE")
     if history is not None:
         if history.key != snapshot["idempotency_key"] or history.claim is None or history.claim_bytes != canonical_bytes(claim["value"]):
@@ -983,30 +1048,77 @@ def reconstruct_snapshot_sources(
 
     sources: dict[str, Any] = {}
     referenced_raw: set[str] = set()
+    failure_seen = False
     for source_id in SOURCE_ORDER:
         parsed_pages = []
         expected_url = URLS[source_id]
         for page, manifest in enumerate(groups[source_id]):
+            statuses = (
+                manifest.get("source_status"),
+                manifest.get("parse_status"),
+                manifest.get("qa_status"),
+            )
+            failure_code = {
+                ("SOURCE_FAILURE", "PARSE_NOT_RUN", "QA_NOT_RUN"): "SOURCE_FAILURE",
+                ("SOURCE_OK", "PARSE_FAILURE", "QA_NOT_RUN"): "PARSE_FAILURE",
+                ("SOURCE_OK", "SCHEMA_FAILURE", "QA_NOT_RUN"): "SCHEMA_FAILURE",
+                ("SOURCE_OK", "PARSE_OK", "DERIVATION_FAILURE"): "DERIVATION_FAILURE",
+                ("SOURCE_OK", "PARSE_OK", "QA_FAILURE"): "QA_FAILURE",
+            }.get(statuses)
+            not_run = statuses == ("SOURCE_NOT_RUN", "PARSE_NOT_RUN", "QA_NOT_RUN")
+            source_ok = statuses == ("SOURCE_OK", "PARSE_OK", "QA_OK")
             if (
                 manifest.get("I_impl") != expected_i_impl
                 or manifest.get("page_ordinal") != page
                 or manifest.get("canonical_url_without_secret") != expected_url
-                or (manifest.get("source_status"), manifest.get("parse_status"), manifest.get("qa_status"))
-                != ("SOURCE_OK", "PARSE_OK", "QA_OK")
-                or manifest.get("error_record_relative_path") is not None
-                or manifest.get("error_record_sha256") is not None
+                or not (source_ok or failure_code or not_run)
             ):
                 raise PitError("SOURCE_PROVENANCE")
+            if not_run:
+                if (
+                    not failure_seen
+                    or len(groups[source_id]) != 1
+                    or page != 0
+                    or any(manifest.get(field) is not None for field in (
+                        "error_record_relative_path", "error_record_sha256", "fetched_at_utc",
+                        "http_status", "raw_bytes", "raw_relative_path", "raw_sha256",
+                        "requested_at_utc", "server_time_utc",
+                    ))
+                    or manifest.get("attempt_count") != 0
+                ):
+                    raise PitError("SOURCE_PROVENANCE")
+                continue
+            if failure_seen:
+                raise PitError("SOURCE_PROVENANCE")
+            if source_ok:
+                if manifest.get("error_record_relative_path") is not None or manifest.get("error_record_sha256") is not None:
+                    raise PitError("SOURCE_PROVENANCE")
+            else:
+                error_path = manifest.get("error_record_relative_path")
+                if (
+                    not isinstance(error_path, str)
+                    or artifact_path(error_path) != error_path
+                    or not SHA256_RE.fullmatch(manifest.get("error_record_sha256", ""))
+                ):
+                    raise PitError("SOURCE_PROVENANCE")
+                failure_seen = True
             raw_path = manifest.get("raw_relative_path")
-            raw = history.raw.get(raw_path)
+            raw = history.raw.get(raw_path) if isinstance(raw_path, str) else None
+            if raw is None:
+                if failure_code != "SOURCE_FAILURE" or any(manifest.get(field) is not None for field in (
+                    "raw_relative_path", "raw_bytes", "raw_sha256", "fetched_at_utc",
+                )):
+                    raise PitError("RAW_PROVENANCE")
+                continue
             if (
-                raw is None
-                or raw_path != slot_artifact(claim["value"]["formal_slot_utc"], "raw", source_id + "-" + str(page) + ".bin")
+                raw_path != slot_artifact(claim["value"]["formal_slot_utc"], "raw", source_id + "-" + str(page) + ".bin")
                 or manifest.get("raw_bytes") != len(raw)
                 or manifest.get("raw_sha256") != sha256(raw)
             ):
                 raise PitError("RAW_PROVENANCE")
             referenced_raw.add(raw_path)
+            if failure_code is not None:
+                continue
             try:
                 body = json.loads(raw, parse_constant=_reject_constant)
             except (json.JSONDecodeError, TypeError, UnicodeDecodeError, PitError) as exc:
@@ -1025,10 +1137,12 @@ def reconstruct_snapshot_sources(
                     if not cursor:
                         raise PitError("INCOMPLETE_SOURCE_SET")
                     expected_url = URLS[source_id] + "&cursor=" + urllib.parse.quote(cursor, safe="")
-                elif cursor:
+                elif cursor and not failure_seen:
                     raise PitError("INCOMPLETE_SOURCE_SET")
-        if source_id != "CG_TOP250":
+        if source_id != "CG_TOP250" and parsed_pages:
             sources[source_id] = parsed_pages if source_id == "BY_LINEAR_INSTRUMENTS" else parsed_pages[0]
+    if groups["CG_TOP250"][0].get("source_status") != "SOURCE_OK":
+        raise PitError("SOURCE_PROVENANCE")
     if referenced_raw != set(history.raw):
         raise PitError("RAW_PROVENANCE")
     sources["__source_manifests__"] = source_manifests
@@ -1651,8 +1765,17 @@ def acquire_fixture_sources(
     parsed["__source_manifests__"] = list(ledger.manifests[key])
     parsed["__error_records__"] = list(ledger.error_records.get(key, []))
     if failure:
-        kind = "GAP_UNIVERSE" if "CG_TOP250" not in parsed else "SNAPSHOT_PARTIAL"
-        outcome = base_outcome(claim, kind, [failure], ledger.raw.get(key, []), ledger.head, manifest_hashes)
+        if "CG_TOP250" in parsed:
+            universe_raw = next(
+                raw for path, raw in ledger.raw.get(key, [])
+                if path.endswith("/CG_TOP250-0.bin")
+            )
+            outcome = build_snapshot(universe_raw, parsed, claim)
+        else:
+            outcome = base_outcome(
+                claim, "GAP_UNIVERSE", [failure],
+                ledger.raw.get(key, []), ledger.head, manifest_hashes,
+            )
         parsed["__outcome__"] = outcome
         if publish_failure and key not in ledger.outcomes:
             ledger.publish_outcome(key, outcome, ledger.authorized_writer, ledger.head)
@@ -1959,6 +2082,7 @@ class GitWriter:
             if path.startswith(slot_root(slot) + "source-manifests/")
         ]
         manifests = [validate_canonical(self.read_at(head, path) or b"") for path in manifest_paths]
+        manifests.sort(key=lambda item: (SOURCE_ORDER.index(item["source_id"]), item["page_ordinal"]))
         manifest_hashes = sorted({sha256(canonical_bytes(item)) for item in manifests})
         if outcome.get("source_manifest_sha256s") != manifest_hashes:
             return "EPOCH_WRITER_STOP"
@@ -1995,8 +2119,10 @@ class GitWriter:
             "terminal_parent": outcome_parents[0],
         } or slot_manifest.get("ledger_seq") != record["ledger_seq"]:
             return "EPOCH_WRITER_STOP"
-        if "assets" in outcome:
+        if outcome.get("outcome_kind") in {"SNAPSHOT_COMPLETE", "SNAPSHOT_PARTIAL", "SNAPSHOT_INVALID"}:
             try:
+                if claim is None:
+                    raise PitError("CLAIM_PROVENANCE")
                 context = self.context(h0, head, key)
                 wrapped_claim = {"relative_path": claim_path, "value": claim}
                 validate_snapshot(outcome, wrapped_claim, manifests, context, True, expected_i_impl)
@@ -2060,6 +2186,15 @@ class GitWriter:
                 available_raw_count=len(raw_pairs),
                 available_raw_relative_paths=[item[0] for item in raw_pairs],
                 available_raw_sha256s=sorted({item[1] for item in raw_pairs}),
+            )
+        if outcome.get("outcome_kind") in {"SNAPSHOT_COMPLETE", "SNAPSHOT_PARTIAL", "SNAPSHOT_INVALID"}:
+            validate_snapshot(
+                outcome,
+                claim,
+                [item for _, item in manifests],
+                context,
+                False,
+                expected_i_impl,
             )
         outcome_path = PREFIX + "outcomes/" + claim_filesafe(slot) + ".json"
         outcome_bytes = canonical_bytes(outcome)
@@ -2239,14 +2374,14 @@ def live_capture() -> None:
         outcome = parsed["__outcome__"]
     else:
         outcome = build_snapshot(parsed["CG_TOP250"].encode() if isinstance(parsed["CG_TOP250"], str) else ledger.raw[key][0][1], parsed, claim)
-    if "assets" in outcome:
+    if outcome.get("outcome_kind") in {"SNAPSHOT_COMPLETE", "SNAPSHOT_PARTIAL", "SNAPSHOT_INVALID"}:
         validate_snapshot(outcome)
     status, final_head = writer.publish_terminal(
         env["PIT_H0"], claim, outcome["outcome_kind"], outcome["reason_codes"], True, env["PIT_I_IMPL"], outcome
     )
     if status not in {"PUBLISHED", "DUPLICATE_NO_WRITE"}:
         raise PitError("EPOCH_WRITER_STOP")
-    if "assets" in outcome:
+    if outcome.get("outcome_kind") in {"SNAPSHOT_COMPLETE", "SNAPSHOT_PARTIAL", "SNAPSHOT_INVALID"}:
         final = validate_canonical(writer.read_at(final_head, PREFIX + "outcomes/" + claim_filesafe(slot) + ".json") or b"")
         context = writer.context(env["PIT_H0"], final_head, key)
         manifests = sorted(context.source_manifests.values(), key=lambda item: (SOURCE_ORDER.index(item["source_id"]), item["page_ordinal"]))
