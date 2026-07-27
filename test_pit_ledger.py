@@ -51,21 +51,15 @@ def complete_snapshot_fixture(bybit_page_count=1, binance_case=None, failed_sour
     bodies = {
         "CG_TOP250": universe(), "BN_FUT_EXCHANGE_INFO": b'{"symbols":[]}',
         "BN_FUT_PREMIUM_INDEX": b"[]", "BN_FUT_BOOK_TICKER": b"[]",
-        "BN_MARGIN_ASSETS": b"[]", "BN_MARGIN_PAIRS": b"[]",
         "BY_LINEAR_TICKERS": b'{"result":{"list":[]},"time":1720000000123}',
         "BY_SPOT_INSTRUMENTS": b'{"result":{"list":[]}}',
         "BY_MARGIN_BORROWABLE": b'{"result":{"list":[]}}',
     }
-    if binance_case in {"missing_ticker", "borrow_failure"}:
+    if binance_case in {"missing_ticker", "public_perp"}:
         bodies["BN_FUT_EXCHANGE_INFO"] = json.dumps(
             {"symbols": [binance_instrument("X0")]}, separators=(",", ":")
         ).encode()
-    if binance_case in {"borrow_failure", "no_perp_borrow_failure"}:
-        bodies.update(
-            BN_MARGIN_ASSETS=b'[{"assetName":"X0","isBorrowable":true},{"assetName":"X0","isBorrowable":true}]',
-            BN_MARGIN_PAIRS=b'[{"base":"X0","isMarginTrade":true,"isSellAllowed":true,"quote":"USDT"}]',
-        )
-    if binance_case == "borrow_failure":
+    if binance_case == "public_perp":
         bodies.update(
             BN_FUT_PREMIUM_INDEX=b'[{"indexPrice":"100","lastFundingRate":"0.001","markPrice":"100","symbol":"X0USDT","time":1720000000123}]',
             BN_FUT_BOOK_TICKER=b'[{"askPrice":"100","bidPrice":"99","symbol":"X0USDT"}]',
@@ -176,6 +170,8 @@ class CanonicalTests(unittest.TestCase):
             {"outcome_kind": "SNAPSHOT_PARTIAL", "slot_status": "COMPLETE"},
             {"missing_reasons": ["QA_FAILURE", "SCHEMA_FAILURE"]},
             {"reason_codes": ["QA_FAILURE", "QA_FAILURE"]},
+            {"reason_codes": ["NOT_OBSERVED_PUBLIC_ONLY"]},
+            {"auth_class": "READ_ONLY"},
             {"reason_codes": ["OTHER"]},
         ]
         for value in bad:
@@ -191,12 +187,19 @@ class CanonicalTests(unittest.TestCase):
             p.ordered(["NO_RAW_DURABLY_PUBLISHED", "ATTEMPT_ABORTED"], p.REASON_CODE_ORDER),
             ["ATTEMPT_ABORTED", "NO_RAW_DURABLY_PUBLISHED"],
         )
+        self.assertEqual(
+            p.ordered(["SOURCE_FAILURE", "NOT_OBSERVED_PUBLIC_ONLY"], p.MISSING_REASON_ORDER),
+            ["NOT_OBSERVED_PUBLIC_ONLY", "SOURCE_FAILURE"],
+        )
 
-    def test_three_r4_exact_byte_oracles(self):
+    def test_r4_and_public_only_exact_byte_oracles(self):
         expected = (
             (242, "BB6A1F4C2A99D23E31C79809A1D25A38720A004831C34FE168EC681788EC2165"),
             (333, "8D13A204BDC833121A88F3C531B74A677987E0CE8A96C5610C9DA8C10CA2300D"),
             (257, "96701B35D8FC21BB3BD17BD3F27BA492E82C0959AEEEC9CB31BDDD58B7575CA4"),
+            (179, "C467F918C0C5948E83DD95484A4502306F8344CA0BAC8507946D73E1033035FE"),
+            (244, "C92039EC6CDBCB43F6210450CE969B230252AA700577FE77C8FF2D9149F4640A"),
+            (244, "4BC9C82E097C5348587C773DC0D6EA18C08D3A68A4FCAC1146A3A44BAD0AD8B6"),
         )
         for value, oracle in zip(p.oracle_objects(), expected):
             data = p.canonical_bytes(value)
@@ -272,13 +275,21 @@ class UniverseAndMappingTests(unittest.TestCase):
             self.assertEqual(many["outcome_kind"], "SNAPSHOT_PARTIAL")
             self.assertIsNone(p.perp_decision(venue, "BTC", [], False)["perp_exists"])
 
-    def test_binance_assetName_and_borrowable_tristate(self):
-        assets = [{"assetName": "BTC", "isBorrowable": True}]
-        pairs = [{"base": "BTC", "quote": "USDT", "isMarginTrade": True, "isSellAllowed": True}]
-        self.assertIs(p.borrowable_binance("BTC", assets, pairs), True)
-        self.assertIs(p.borrowable_binance("ETH", assets, pairs), False)
-        self.assertIs(p.borrowable_binance("BTC", [{"asset": "BTC", "isBorrowable": True}], pairs), False)
-        self.assertIsNone(p.borrowable_binance("BTC", assets * 2, pairs))
+    def test_binance_mapped_borrow_is_public_only_null_and_complete(self):
+        _, _, snapshot, _ = complete_snapshot_fixture(binance_case="public_perp")
+        row = snapshot["assets"][0]["venues"][0]
+        self.assertIs(row["perp_exists"], True)
+        self.assertIsNone(row["borrowable"])
+        self.assertEqual(row["missing_reasons"], ["NOT_OBSERVED_PUBLIC_ONLY"])
+        self.assertEqual(
+            (snapshot["outcome_kind"], snapshot["reason_codes"], snapshot["qa"]),
+            ("SNAPSHOT_COMPLETE", [], {"qa_status": "QA_OK", "reason_codes": []}),
+        )
+        for invalid in (False, 0):
+            broken = json.loads(json.dumps(snapshot))
+            broken["assets"][0]["venues"][0]["borrowable"] = invalid
+            with self.assertRaises(p.PitError):
+                p.validate_snapshot(broken)
 
     def test_bybit_uta_four_margin_enums_and_unknown(self):
         currencies = [{"currency": "BTC", "borrowable": True}]
@@ -299,8 +310,6 @@ class UniverseAndMappingTests(unittest.TestCase):
             "BN_FUT_EXCHANGE_INFO": b'{"symbols":[]}',
             "BN_FUT_PREMIUM_INDEX": b"[]",
             "BN_FUT_BOOK_TICKER": b"[]",
-            "BN_MARGIN_ASSETS": b"[]",
-            "BN_MARGIN_PAIRS": b"[]",
             "BY_LINEAR_TICKERS": b'{"result":{"list":[]},"time":1720000000123}',
             "BY_SPOT_INSTRUMENTS": b'{"result":{"list":[]}}',
             "BY_MARGIN_BORROWABLE": b'{"result":{"list":[]}}',
@@ -312,17 +321,21 @@ class UniverseAndMappingTests(unittest.TestCase):
         parsed = p.acquire_fixture_sources(ledger, claim, fetch)
         kinds = [event.split(":", 1)[0] for event in ledger.events]
         self.assertEqual(kinds[0], "claim")
-        self.assertEqual(kinds[1:], ["request", "raw", "parse", "manifest"] * 6 + ["request", "raw", "parse", "manifest"] * 2 + ["request", "raw", "parse", "manifest"] * 3)
+        self.assertEqual(kinds[1:], ["request", "raw", "parse", "manifest"] * 4 + ["request", "raw", "parse", "manifest"] * 2 + ["request", "raw", "parse", "manifest"] * 3)
         request_sources = [event.rsplit(":", 1)[-1] for event in ledger.events if event.startswith("request:")]
-        self.assertEqual(request_sources, list(p.SOURCE_ORDER[:6]) + ["BY_LINEAR_INSTRUMENTS"] * 2 + list(p.SOURCE_ORDER[7:]))
+        self.assertEqual(request_sources, list(p.SOURCE_ORDER[:4]) + ["BY_LINEAR_INSTRUMENTS"] * 2 + list(p.SOURCE_ORDER[5:]))
+        self.assertEqual({item["auth_class"] for item in parsed["__source_manifests__"]}, {"PUBLIC"})
         snapshot = p.build_snapshot(raw, parsed, claim)
         p.validate_snapshot(snapshot)
         self.assertEqual(snapshot["outcome_kind"], "SNAPSHOT_COMPLETE")
         self.assertEqual(len(snapshot["assets"]), 250)
         self.assertEqual(sum(len(asset["venues"]) for asset in snapshot["assets"]), 500)
         self.assertEqual([row["venue"] for row in snapshot["assets"][0]["venues"]], list(p.VENUES))
-        self.assertIs(snapshot["assets"][0]["venues"][0]["borrowable"], False)
-        self.assertEqual(snapshot["assets"][0]["venues"][0]["missing_reasons"], ["NOT_APPLICABLE_NO_PERP"])
+        self.assertIsNone(snapshot["assets"][0]["venues"][0]["borrowable"])
+        self.assertEqual(
+            snapshot["assets"][0]["venues"][0]["missing_reasons"],
+            ["NOT_APPLICABLE_NO_PERP", "NOT_OBSERVED_PUBLIC_ONLY"],
+        )
         broken = dict(snapshot, assets=snapshot["assets"][:-1])
         with self.assertRaises(p.PitError):
             p.validate_snapshot(broken)
@@ -358,6 +371,11 @@ class DerivationAndSourceTests(unittest.TestCase):
         self.assertEqual(p.funding_schema_failure("BY_LINEAR_TICKERS")["funding_observed_at_utc"], None)
 
     def test_endpoint_method_auth_allowlist_and_no_v4(self):
+        self.assertEqual(p.SOURCE_ORDER, (
+            "CG_TOP250", "BN_FUT_EXCHANGE_INFO", "BN_FUT_PREMIUM_INDEX",
+            "BN_FUT_BOOK_TICKER", "BY_LINEAR_INSTRUMENTS", "BY_LINEAR_TICKERS",
+            "BY_SPOT_INSTRUMENTS", "BY_MARGIN_BORROWABLE",
+        ))
         for source, url in p.URLS.items():
             p.validate_source_url(source, url)
             self.assertNotIn("v4", url.lower())
@@ -366,6 +384,17 @@ class DerivationAndSourceTests(unittest.TestCase):
                 p.validate_source_url(source, url)
         self.assertEqual(set(p.SOURCE_ORDER), set(p.URLS))
         self.assertEqual(p.ENUMS["method"], {"GET"})
+        self.assertEqual(p.ENUMS["auth_class"], {"PUBLIC"})
+        production = (
+            Path(p.__file__).read_text()
+            + (Path(__file__).parent / ".github/workflows/pit-ledger.yml").read_text()
+        )
+        for forbidden in (
+            "BN_MARGIN_ASSETS", "BN_MARGIN_PAIRS", "READ_ONLY_MARKET_DATA",
+            "BINANCE_MARKET_DATA_API_KEY", "PIT_KEY_PERMISSION_PROOF",
+            "PIT_SECRET_APPROVED", "X-MBX-APIKEY",
+        ):
+            self.assertNotIn(forbidden, production)
 
     def test_bybit_cursor_pagination_received_order_complete(self):
         seen = []
@@ -526,12 +555,9 @@ class PermissionAndStaticTests(unittest.TestCase):
             "PIT_ACTIVATION_APPROVED": "YES",
             "PIT_ACTIVATION_CANDIDATE_SLOT": "2026-07-26T20:00:00.000Z",
             "PIT_TARGET_WRITE_APPROVED": "YES",
-            "PIT_SECRET_APPROVED": "YES",
-            "PIT_KEY_PERMISSION_PROOF": "READ_ONLY_MARKET_DATA_NO_TRADE_BORROW_TRANSFER_WITHDRAW",
             "PIT_AUTHORIZED_WRITER": "writer",
             "PIT_I_IMPL": digest,
             "PIT_H0": "H0",
-            "BINANCE_MARKET_DATA_API_KEY": "redacted-fixture",
         }
         p.require_live_authorization(full, Path(__file__).parent)
         for name in tuple(full):
@@ -539,9 +565,6 @@ class PermissionAndStaticTests(unittest.TestCase):
             env.pop(name)
             with self.assertRaises(p.PitError, msg=name):
                 p.require_live_authorization(env, Path(__file__).parent)
-        wrong = dict(full, PIT_KEY_PERMISSION_PROOF="TRADE")
-        with self.assertRaises(p.PitError):
-            p.require_live_authorization(wrong, Path(__file__).parent)
         for bad in ("A", "0" * 64):
             with self.assertRaises(p.PitError):
                 p.require_live_authorization(dict(full, PIT_I_IMPL=bad), Path(__file__).parent)
@@ -581,7 +604,7 @@ class PermissionAndStaticTests(unittest.TestCase):
 
         ledger, claim = claimed()
         result = p.acquire_fixture_sources(ledger, claim, lambda *_: (500, b"", {}))
-        self.assertEqual(len(result["__source_manifests__"]), 10)
+        self.assertEqual(len(result["__source_manifests__"]), 8)
         self.assertEqual(result["__source_manifests__"][0]["source_status"], "SOURCE_FAILURE")
         self.assertEqual(len(ledger.outcomes), 1)
         self.assertEqual(result["__outcome__"]["outcome_kind"], "GAP_UNIVERSE")
@@ -593,13 +616,13 @@ class PermissionAndStaticTests(unittest.TestCase):
             datetime(2026, 7, 26, 20, 10, tzinfo=timezone.utc),
         ))
         result = p.acquire_fixture_sources(ledger, claim, lambda *_: (200, universe(), {}), lambda: next(times))
-        self.assertEqual(len(result["__source_manifests__"]), 10)
+        self.assertEqual(len(result["__source_manifests__"]), 8)
         self.assertEqual(len(ledger.outcomes), 1)
         self.assertEqual(result["__source_manifests__"][0]["source_status"], "SOURCE_FAILURE")
 
         ledger, claim = claimed()
         result = p.acquire_fixture_sources(ledger, claim, lambda *_: (_ for _ in ()).throw(RuntimeError("fixture")))
-        self.assertEqual(len(result["__source_manifests__"]), 10)
+        self.assertEqual(len(result["__source_manifests__"]), 8)
         self.assertEqual(len(ledger.outcomes), 1)
 
         ledger, claim = claimed()
@@ -646,12 +669,12 @@ class PermissionAndStaticTests(unittest.TestCase):
         _, _, snapshot, _ = complete_snapshot_fixture(binance_case="missing_ticker")
         row = snapshot["assets"][0]["venues"][0]
         self.assertIs(row["perp_exists"], True)
-        self.assertIs(row["borrowable"], False)
+        self.assertIsNone(row["borrowable"])
         self.assertTrue(all(row[field] is None for field in (
             "funding_rate", "funding_observed_at_utc", "bid_price", "ask_price",
             "spread_bps", "mark_price", "index_price",
         )))
-        self.assertEqual(row["missing_reasons"], ["SCHEMA_FAILURE"])
+        self.assertEqual(row["missing_reasons"], ["NOT_OBSERVED_PUBLIC_ONLY", "SCHEMA_FAILURE"])
         self.assertEqual(
             (snapshot["outcome_kind"], snapshot["slot_status"], snapshot["reason_codes"]),
             ("SNAPSHOT_PARTIAL", "PARTIAL", ["SCHEMA_FAILURE"]),
@@ -661,8 +684,8 @@ class PermissionAndStaticTests(unittest.TestCase):
         with self.assertRaises(p.PitError):
             p.validate_snapshot(inconsistent)
 
-    def test_existing_perp_independent_borrow_failure_is_snapshot_partial(self):
-        _, _, snapshot, _ = complete_snapshot_fixture(binance_case="borrow_failure")
+    def test_existing_perp_public_only_borrow_is_not_an_error(self):
+        claim, manifests, snapshot, context = complete_snapshot_fixture(binance_case="public_perp")
         row = snapshot["assets"][0]["venues"][0]
         self.assertIs(row["perp_exists"], True)
         self.assertIsNone(row["borrowable"])
@@ -673,23 +696,26 @@ class PermissionAndStaticTests(unittest.TestCase):
             ),
             ("0.001", "2024-07-03T09:46:40.123Z", "99", "100", "100.50251256", "100", "100"),
         )
-        self.assertEqual(row["missing_reasons"], ["SCHEMA_FAILURE"])
+        self.assertEqual(row["missing_reasons"], ["NOT_OBSERVED_PUBLIC_ONLY"])
         self.assertEqual(
             (snapshot["outcome_kind"], snapshot["slot_status"], snapshot["reason_codes"]),
-            ("SNAPSHOT_PARTIAL", "PARTIAL", ["SCHEMA_FAILURE"]),
+            ("SNAPSHOT_COMPLETE", "COMPLETE", []),
         )
+        p.validate_snapshot(snapshot, claim, manifests, context, False, "A" * 64)
         inconsistent = json.loads(json.dumps(snapshot))
         inconsistent["assets"][0]["venues"][0]["borrowable"] = False
         with self.assertRaises(p.PitError):
             p.validate_snapshot(inconsistent)
 
-    def test_contextual_raw_rederivation_accepts_both_legal_partials(self):
-        for case in ("missing_ticker", "borrow_failure"):
+    def test_contextual_raw_rederivation_accepts_complete_and_partial(self):
+        for case, kind in (("missing_ticker", "SNAPSHOT_PARTIAL"), ("public_perp", "SNAPSHOT_COMPLETE")):
             with self.subTest(case=case):
                 claim, manifests, snapshot, context = complete_snapshot_fixture(binance_case=case)
+                self.assertEqual(snapshot["outcome_kind"], kind)
                 p.validate_snapshot(snapshot, claim, manifests, context, False, "A" * 64)
 
     def test_post_cg_failure_each_later_source_has_full_validated_snapshot_and_missing_assets_never_publishes(self):
+        self.assertEqual(len(p.SOURCE_ORDER[1:]), 7)
         for source_id in p.SOURCE_ORDER[1:]:
             with self.subTest(source_id=source_id):
                 claim, manifests, snapshot, context = complete_snapshot_fixture(failed_source=source_id)
@@ -708,6 +734,12 @@ class PermissionAndStaticTests(unittest.TestCase):
                     (claim["value"]["claimed_at_utc"],) * 3,
                 )
                 p.validate_snapshot(snapshot, claim, manifests, context, False, "A" * 64)
+                if source_id == "BN_FUT_EXCHANGE_INFO":
+                    row = snapshot["assets"][0]["venues"][0]
+                    self.assertEqual(
+                        (row["perp_exists"], row["borrowable"], row["missing_reasons"]),
+                        (None, None, ["NOT_OBSERVED_PUBLIC_ONLY", "SOURCE_FAILURE"]),
+                    )
 
         writer_identity = "PIT Ledger Writer <pit@example.invalid>"
         with tempfile.TemporaryDirectory(prefix="pit-ledger-missing-assets-") as temp:
@@ -725,9 +757,9 @@ class PermissionAndStaticTests(unittest.TestCase):
             git(repo, "config", "user.name", "seed")
             git(repo, "config", "user.email", "seed@example.invalid")
             git(repo, "commit", "--allow-empty", "--quiet", "-m", "H0")
-            git(repo, "branch", "-M", "pit-ledger-v1")
+            git(repo, "branch", "-M", "pit-ledger-public-v1")
             git(repo, "remote", "add", "origin", str(remote))
-            git(repo, "push", "--quiet", "-u", "origin", "pit-ledger-v1")
+            git(repo, "push", "--quiet", "-u", "origin", "pit-ledger-public-v1")
             h0 = git(repo, "rev-parse", "HEAD")
             git(repo, "config", "user.name", "PIT Ledger Writer")
             git(repo, "config", "user.email", "pit@example.invalid")
@@ -854,10 +886,8 @@ class PermissionAndStaticTests(unittest.TestCase):
             self.assertEqual(duplicate_status, "EPOCH_WRITER_STOP")
             self.assertEqual(calls, [True])
 
-    def test_no_perp_with_independent_borrow_failure_is_contextually_valid_only_when_consistent(self):
-        claim, manifests, snapshot, context = complete_snapshot_fixture(
-            binance_case="no_perp_borrow_failure",
-        )
+    def test_no_perp_with_public_only_borrow_is_contextually_valid_only_when_consistent(self):
+        claim, manifests, snapshot, context = complete_snapshot_fixture()
         row = snapshot["assets"][0]["venues"][0]
         self.assertIs(row["perp_exists"], False)
         self.assertIsNone(row["borrowable"])
@@ -865,11 +895,15 @@ class PermissionAndStaticTests(unittest.TestCase):
             "funding_rate", "funding_observed_at_utc", "bid_price", "ask_price",
             "spread_bps", "mark_price", "index_price",
         )))
-        self.assertEqual(row["missing_reasons"], ["NOT_APPLICABLE_NO_PERP", "SCHEMA_FAILURE"])
-        self.assertEqual(snapshot["reason_codes"], ["SCHEMA_FAILURE"])
+        self.assertEqual(
+            row["missing_reasons"],
+            ["NOT_APPLICABLE_NO_PERP", "NOT_OBSERVED_PUBLIC_ONLY"],
+        )
+        self.assertEqual(snapshot["reason_codes"], [])
+        self.assertEqual(snapshot["outcome_kind"], "SNAPSHOT_COMPLETE")
         p.validate_snapshot(snapshot, claim, manifests, context, False, "A" * 64)
 
-        for change in ("order", "borrowable", "snapshot_reason"):
+        for change in ("order", "borrowable", "missing_reason"):
             with self.subTest(change=change):
                 inconsistent = json.loads(json.dumps(snapshot))
                 target = inconsistent["assets"][0]["venues"][0]
@@ -878,18 +912,17 @@ class PermissionAndStaticTests(unittest.TestCase):
                 elif change == "borrowable":
                     target["borrowable"] = False
                 else:
-                    inconsistent["reason_codes"] = ["SOURCE_FAILURE"]
-                    inconsistent["qa"]["reason_codes"] = ["SOURCE_FAILURE"]
+                    target["missing_reasons"] = ["NOT_APPLICABLE_NO_PERP"]
                 with self.assertRaises(p.PitError):
                     p.validate_snapshot(inconsistent)
 
     def test_missing_any_source_or_page_rejected(self):
         claim, manifests, snapshot, context = complete_snapshot_fixture(2)
-        missing_source = [item for item in manifests if item["source_id"] != "BN_MARGIN_PAIRS"]
+        missing_source = [item for item in manifests if item["source_id"] != "BY_MARGIN_BORROWABLE"]
         source_context = p.GitContext(
             context.h0, context.head, context.key, context.claim, context.claim_bytes,
-            {path: raw for path, raw in context.raw.items() if "BN_MARGIN_PAIRS" not in path},
-            {path: item for path, item in context.source_manifests.items() if item["source_id"] != "BN_MARGIN_PAIRS"},
+            {path: raw for path, raw in context.raw.items() if "BY_MARGIN_BORROWABLE" not in path},
+            {path: item for path, item in context.source_manifests.items() if item["source_id"] != "BY_MARGIN_BORROWABLE"},
             context.log, context.outcome_count, context.claim_before_raw,
         )
         with self.assertRaises(p.PitError):
@@ -969,9 +1002,10 @@ class PermissionAndStaticTests(unittest.TestCase):
     def test_schedule_and_branch_writer_are_frozen(self):
         workflow = (Path(__file__).parent / ".github/workflows/pit-ledger.yml").read_text()
         self.assertIn('cron: "2,32 * * * *"', workflow)
-        self.assertIn("ref: pit-ledger-v1", workflow)
+        self.assertIn("ref: pit-ledger-public-v1", workflow)
         self.assertIn("contents: write", workflow)
-        self.assertIn("HEAD:refs/heads/pit-ledger-v1", workflow)
+        self.assertIn("HEAD:refs/heads/pit-ledger-public-v1", workflow)
+        self.assertNotIn("secrets.", workflow)
         p.acquisition_window("2026-07-26T20:00:00.000Z", datetime(2026, 7, 26, 20, 2, tzinfo=timezone.utc))
         p.acquisition_window("2026-07-26T20:30:00.000Z", datetime(2026, 7, 26, 20, 32, tzinfo=timezone.utc))
         for now in (datetime(2026, 7, 26, 19, 59, tzinfo=timezone.utc), datetime(2026, 7, 26, 20, 10, tzinfo=timezone.utc)):

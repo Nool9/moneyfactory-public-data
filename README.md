@@ -1,6 +1,6 @@
-# PIT ledger v1
+# PIT ledger public-only v1
 
-Local, offline implementation stage for the frozen PIT ledger v1 r4 contract.
+Local, offline implementation stage for the composed PIT ledger public-only v1 contract.
 
 Checks:
 
@@ -12,13 +12,13 @@ git diff --check
 ```
 
 The workflow is a thin `schedule` wrapper installed on the default branch. It
-checks out and writes only `pit-ledger-v1` and fails closed
+checks out and writes only `pit-ledger-public-v1` and fails closed
 before network access unless every separately governed activation, target-write,
-secret, writer, implementation, epoch and permission boundary is present.
+writer, implementation and epoch boundary is present.
 Each slot has an immutable namespace, real log/slot manifest, checkpoint and
 continuous append-only ledger index. The outcome, slot manifest, index record
 and checkpoint share one atomic terminal commit; duplicate acceptance replays
-all ten sources and every Bybit page from raw bytes against the pinned
+all eight public sources and every Bybit page from raw bytes against the pinned
 implementation, and overdue recovery precedes the current-window gate.
 
 This child commit is not an activation: no live download, collector-v4 read,

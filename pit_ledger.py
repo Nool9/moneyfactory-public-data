@@ -23,8 +23,8 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Callable, Iterable
 
-CONTRACT_ID = "PIT_LEDGER_V1"
-EPOCH_ID = "BASKET_PIT_LEDGER_TOP250_BINANCE_BYBIT_V1"
+CONTRACT_ID = "PIT_LEDGER_PUBLIC_ONLY_V1"
+EPOCH_ID = "BASKET_PIT_LEDGER_TOP250_BINANCE_BYBIT_PUBLIC_V1"
 PREFIX = f"pit_ledger/{EPOCH_ID}/"
 CONCURRENCY_GROUP = f"pit-ledger-{EPOCH_ID}"
 VENUES = ("BINANCE_USDM", "BYBIT_LINEAR")
@@ -33,8 +33,6 @@ SOURCE_ORDER = (
     "BN_FUT_EXCHANGE_INFO",
     "BN_FUT_PREMIUM_INDEX",
     "BN_FUT_BOOK_TICKER",
-    "BN_MARGIN_ASSETS",
-    "BN_MARGIN_PAIRS",
     "BY_LINEAR_INSTRUMENTS",
     "BY_LINEAR_TICKERS",
     "BY_SPOT_INSTRUMENTS",
@@ -45,17 +43,15 @@ URLS = {
     "BN_FUT_EXCHANGE_INFO": "https://fapi.binance.com/fapi/v1/exchangeInfo",
     "BN_FUT_PREMIUM_INDEX": "https://fapi.binance.com/fapi/v1/premiumIndex",
     "BN_FUT_BOOK_TICKER": "https://fapi.binance.com/fapi/v1/ticker/bookTicker",
-    "BN_MARGIN_ASSETS": "https://api.binance.com/sapi/v1/margin/allAssets",
-    "BN_MARGIN_PAIRS": "https://api.binance.com/sapi/v1/margin/allPairs",
     "BY_LINEAR_INSTRUMENTS": "https://api.bybit.com/v5/market/instruments-info?category=linear&limit=1000",
     "BY_LINEAR_TICKERS": "https://api.bybit.com/v5/market/tickers?category=linear",
     "BY_SPOT_INSTRUMENTS": "https://api.bybit.com/v5/market/instruments-info?category=spot",
     "BY_MARGIN_BORROWABLE": "https://api.bybit.com/v5/spot-margin-trade/data?vipLevel=No%20VIP",
 }
-READ_ONLY_SOURCES = {"BN_MARGIN_ASSETS", "BN_MARGIN_PAIRS"}
 MARGIN_TRADING = ("none", "both", "utaOnly", "normalSpotOnly")
 MISSING_REASON_ORDER = (
     "NOT_APPLICABLE_NO_PERP",
+    "NOT_OBSERVED_PUBLIC_ONLY",
     "INVALID_SYMBOL_FORMAT",
     "AMBIGUOUS_SYMBOL",
     "AMBIGUOUS_EXCHANGE_PRODUCT",
@@ -79,7 +75,7 @@ ENUMS = {
     "method": {"GET"},
     "source_id": set(SOURCE_ORDER),
     "venue": set(VENUES),
-    "auth_class": {"PUBLIC", "READ_ONLY_MARKET_DATA"},
+    "auth_class": {"PUBLIC"},
     "mapping_status": {"MAPPED", "UNMAPPABLE", "AMBIGUOUS"},
     "claim_status": {"CLAIMED"},
     "source_status": {"SOURCE_NOT_RUN", "SOURCE_OK", "SOURCE_FAILURE"},
@@ -461,20 +457,6 @@ def _unique(rows: Any, predicate: Callable[[dict[str, Any]], bool]) -> dict[str,
     return matches[0] if matches else None
 
 
-def borrowable_binance(base: str, assets: Any, pairs: Any) -> bool | None:
-    try:
-        asset = _unique(assets, lambda row: row.get("assetName") == base)
-        pair = _unique(pairs, lambda row: row.get("base") == base and row.get("quote") == "USDT")
-        if asset is not None and type(asset.get("isBorrowable")) is not bool:
-            raise PitError("SCHEMA_FAILURE")
-        for field in ("isMarginTrade", "isSellAllowed"):
-            if pair is not None and type(pair.get(field)) is not bool:
-                raise PitError("SCHEMA_FAILURE")
-        return bool(asset and pair and asset["isBorrowable"] and pair["isMarginTrade"] and pair["isSellAllowed"])
-    except PitError:
-        return None
-
-
 def borrowable_bybit(base: str, currencies: Any, spots: Any) -> bool | None:
     try:
         if not isinstance(spots, list) or any(
@@ -642,8 +624,6 @@ def build_snapshot(
     bn_instruments = source_rows("BN_FUT_EXCHANGE_INFO", "symbols")
     bn_premium = source_rows("BN_FUT_PREMIUM_INDEX")
     bn_books = source_rows("BN_FUT_BOOK_TICKER")
-    bn_assets = source_rows("BN_MARGIN_ASSETS")
-    bn_pairs = source_rows("BN_MARGIN_PAIRS")
     by_spots = source_rows("BY_SPOT_INSTRUMENTS", "result", "list")
     by_currencies = source_rows("BY_MARGIN_BORROWABLE", "result", "list")
     by_instruments = None
@@ -692,9 +672,9 @@ def build_snapshot(
                     {"perp_exists": None, "missing_reasons": [product_reason]}
                     if product_reason else perp_decision(venue, base, bn_instruments)
                 )
-                borrow_reason = source_errors.get("BN_MARGIN_ASSETS") or source_errors.get("BN_MARGIN_PAIRS")
-                borrowable = None if borrow_reason else borrowable_binance(base, bn_assets, bn_pairs)
-                used_sources = ["BN_FUT_EXCHANGE_INFO", "BN_MARGIN_ASSETS", "BN_MARGIN_PAIRS"]
+                borrow_reason = "NOT_OBSERVED_PUBLIC_ONLY"
+                borrowable = None
+                used_sources = ["BN_FUT_EXCHANGE_INFO"]
                 ticker_reason = source_errors.get("BN_FUT_PREMIUM_INDEX") or source_errors.get("BN_FUT_BOOK_TICKER")
             else:
                 product_reason = source_errors.get("BY_LINEAR_INSTRUMENTS")
@@ -712,7 +692,8 @@ def build_snapshot(
             if borrowable is None:
                 borrow_reason = borrow_reason or "SCHEMA_FAILURE"
                 empty["missing_reasons"] = ordered(empty["missing_reasons"] + [borrow_reason], MISSING_REASON_ORDER)
-                reason_codes.append(borrow_reason)
+                if borrow_reason in REASON_CODE_ORDER:
+                    reason_codes.append(borrow_reason)
             if product["perp_exists"] is True:
                 used_sources += ["BN_FUT_PREMIUM_INDEX", "BN_FUT_BOOK_TICKER"] if venue == "BINANCE_USDM" else ["BY_LINEAR_TICKERS"]
                 if ticker_reason:
@@ -865,29 +846,41 @@ def validate_snapshot(
                 if row["exchange_symbol"] != candidate:
                     raise PitError("MAPPING_RELATION")
                 source_errors = {"SOURCE_FAILURE", "PARSE_FAILURE", "SCHEMA_FAILURE", "DERIVATION_FAILURE", "QA_FAILURE"}
+                binance_public_only = row["venue"] == "BINANCE_USDM"
+                public_only_reason = {"NOT_OBSERVED_PUBLIC_ONLY"} if binance_public_only else set()
+                if (
+                    binance_public_only and (
+                        row["borrowable"] is not None
+                        or "NOT_OBSERVED_PUBLIC_ONLY" not in row["missing_reasons"]
+                    )
+                    or not binance_public_only and "NOT_OBSERVED_PUBLIC_ONLY" in row["missing_reasons"]
+                ):
+                    raise PitError("BORROWABLE_RELATION")
                 if row["perp_exists"] is False:
-                    error_reasons = set(row["missing_reasons"]) - {"NOT_APPLICABLE_NO_PERP"}
+                    base_reasons = {"NOT_APPLICABLE_NO_PERP"} | public_only_reason
+                    error_reasons = set(row["missing_reasons"]) - base_reasons
                     error_state = (
                         bool(error_reasons)
                         and error_reasons <= source_errors
                         and error_reasons <= set(reasons)
                     )
                     expected_reasons = ordered(
-                        ["NOT_APPLICABLE_NO_PERP"] + list(error_reasons),
+                        list(base_reasons | error_reasons),
                         MISSING_REASON_ORDER,
                     )
                     if (
                         any(row[field] is not None for field in prices)
-                        or row["borrowable"] is None and (
+                        or row["missing_reasons"] != expected_reasons
+                        or not binance_public_only and row["borrowable"] is None and (
                             not error_state or row["missing_reasons"] != expected_reasons
                         )
-                        or row["borrowable"] is not None and row["missing_reasons"] != ["NOT_APPLICABLE_NO_PERP"]
+                        or not binance_public_only and row["borrowable"] is not None and error_reasons
                     ):
                         raise PitError("PERP_RELATION")
                 elif row["perp_exists"] is True:
                     market_complete = all(row[field] is not None for field in prices)
                     market_missing = all(row[field] is None for field in prices)
-                    error_reasons = set(row["missing_reasons"])
+                    error_reasons = set(row["missing_reasons"]) - public_only_reason
                     error_state = bool(error_reasons) and error_reasons <= source_errors and error_reasons <= set(reasons)
                     if not market_complete and not (market_missing and error_state):
                         raise PitError("PERP_RELATION")
@@ -897,9 +890,14 @@ def validate_snapshot(
                         validate_utc(row["funding_observed_at_utc"])
                         for field in ("funding_rate", "bid_price", "ask_price", "mark_price", "index_price"):
                             parse_decimal_string(row[field], positive=field != "funding_rate")
-                    if row["borrowable"] is None and not error_state:
+                    if not binance_public_only and row["borrowable"] is None and not error_state:
                         raise PitError("BORROWABLE_RELATION")
-                    if error_reasons and not error_state or market_complete and row["borrowable"] is not None and error_reasons:
+                    if (
+                        error_reasons and not error_state
+                        or market_complete and row["borrowable"] is not None and error_reasons
+                        or market_complete and not error_reasons
+                        and row["missing_reasons"] != ordered(public_only_reason, MISSING_REASON_ORDER)
+                    ):
                         raise PitError("PERP_RELATION")
                 else:
                     if any(row[field] is not None for field in prices):
@@ -909,9 +907,17 @@ def validate_snapshot(
                         ("SOURCE_FAILURE",), ("PARSE_FAILURE",), ("SCHEMA_FAILURE",),
                         ("DERIVATION_FAILURE",), ("QA_FAILURE",),
                     }
-                    if tuple(row["missing_reasons"]) not in allowed_null_reasons:
+                    product_reasons = tuple(
+                        reason for reason in row["missing_reasons"]
+                        if reason != "NOT_OBSERVED_PUBLIC_ONLY"
+                    )
+                    if product_reasons not in allowed_null_reasons:
                         raise PitError("PERP_RELATION")
-                if row["borrowable"] is None and not any(code in row["missing_reasons"] for code in ("SOURCE_FAILURE", "PARSE_FAILURE", "SCHEMA_FAILURE", "DERIVATION_FAILURE", "QA_FAILURE")):
+                if (
+                    not binance_public_only
+                    and row["borrowable"] is None
+                    and not any(code in row["missing_reasons"] for code in source_errors)
+                ):
                     raise PitError("BORROWABLE_RELATION")
             for digest in row["source_raw_sha256s"]:
                 if digest not in snapshot.get("available_raw_sha256s", []):
@@ -953,7 +959,7 @@ def validate_snapshot(
                 if row["mapping_status"] != "MAPPED":
                     expected_hashes: list[str] = []
                 elif row["venue"] == "BINANCE_USDM":
-                    required_sources = ["BN_FUT_EXCHANGE_INFO", "BN_MARGIN_ASSETS", "BN_MARGIN_PAIRS"]
+                    required_sources = ["BN_FUT_EXCHANGE_INFO"]
                     if row["perp_exists"] is True:
                         required_sources += ["BN_FUT_PREMIUM_INDEX", "BN_FUT_BOOK_TICKER"]
                     expected_hashes = sorted({digest for source in required_sources for digest in source_hashes.get(source, [])})
@@ -1212,7 +1218,7 @@ def validate_source_schema(source_id: str, body: Any) -> None:
         raise PitError("INTERNAL_RAW_SCHEMA_REQUIRED")
     if source_id == "BN_FUT_EXCHANGE_INFO":
         rows = _rows(body, "symbols")
-    elif source_id in {"BN_FUT_PREMIUM_INDEX", "BN_FUT_BOOK_TICKER", "BN_MARGIN_ASSETS", "BN_MARGIN_PAIRS"}:
+    elif source_id in {"BN_FUT_PREMIUM_INDEX", "BN_FUT_BOOK_TICKER"}:
         rows = _rows(body)
     elif source_id in {"BY_LINEAR_INSTRUMENTS", "BY_SPOT_INSTRUMENTS", "BY_MARGIN_BORROWABLE"}:
         rows = _rows(body, "result", "list")
@@ -1233,8 +1239,6 @@ def validate_source_schema(source_id: str, body: Any) -> None:
         "BN_FUT_EXCHANGE_INFO": {"symbol": str, "baseAsset": str, "quoteAsset": str, "contractType": str, "status": str},
         "BN_FUT_PREMIUM_INDEX": {"symbol": str, "lastFundingRate": str, "markPrice": str, "indexPrice": str, "time": int},
         "BN_FUT_BOOK_TICKER": {"symbol": str, "bidPrice": str, "askPrice": str},
-        "BN_MARGIN_ASSETS": {"assetName": str, "isBorrowable": bool},
-        "BN_MARGIN_PAIRS": {"base": str, "quote": str, "isMarginTrade": bool, "isSellAllowed": bool},
         "BY_LINEAR_INSTRUMENTS": {"symbol": str, "baseCoin": str, "quoteCoin": str, "settleCoin": str, "contractType": str, "status": str},
         "BY_LINEAR_TICKERS": {"symbol": str, "fundingRate": str, "bid1Price": str, "ask1Price": str, "markPrice": str, "indexPrice": str},
         "BY_SPOT_INSTRUMENTS": {"baseCoin": str, "quoteCoin": str, "marginTrading": str},
@@ -1355,7 +1359,7 @@ def make_claim(
 def run_log_bytes(claim: dict[str, Any]) -> bytes:
     value = claim["value"]
     return (
-        "PIT_LEDGER_V1\n"
+        "PIT_LEDGER_PUBLIC_ONLY_V1\n"
         f"idempotency_key={value['idempotency_key']}\n"
         f"attempt_id={value['attempt_id']}\n"
         f"workflow_run_id={value['workflow_run_id']}\n"
@@ -1627,7 +1631,7 @@ def acquire_fixture_sources(
     def not_run(source_id: str) -> None:
         manifest = {
             "I_impl": claim["value"]["I_impl"], "attempt_count": 0,
-            "auth_class": "READ_ONLY_MARKET_DATA" if source_id in READ_ONLY_SOURCES else "PUBLIC",
+            "auth_class": "PUBLIC",
             "canonical_url_without_secret": URLS[source_id], "error_record_relative_path": None,
             "error_record_sha256": None, "fetched_at_utc": None, "http_status": None,
             "method": "GET", "page_ordinal": 0, "parse_status": "PARSE_NOT_RUN",
@@ -1716,7 +1720,7 @@ def acquire_fixture_sources(
             }[code]
             manifest = {
                 "I_impl": claim["value"]["I_impl"], "attempt_count": attempts,
-                "auth_class": "READ_ONLY_MARKET_DATA" if source_id in READ_ONLY_SOURCES else "PUBLIC",
+                "auth_class": "PUBLIC",
                 "canonical_url_without_secret": url, "error_record_relative_path": error_path,
                 "error_record_sha256": error_hash, "fetched_at_utc": claim["value"]["claimed_at_utc"] if raw is not None else None,
                 "http_status": status, "method": "GET", "page_ordinal": page_ordinal,
@@ -1801,13 +1805,10 @@ def require_live_authorization(env: dict[str, str], root: os.PathLike[str] | str
     required = {
         "PIT_ACTIVATION_APPROVED": "YES",
         "PIT_TARGET_WRITE_APPROVED": "YES",
-        "PIT_SECRET_APPROVED": "YES",
-        "PIT_KEY_PERMISSION_PROOF": "READ_ONLY_MARKET_DATA_NO_TRADE_BORROW_TRANSFER_WITHDRAW",
         "PIT_AUTHORIZED_WRITER": "",
         "PIT_I_IMPL": "",
         "PIT_H0": "",
         "PIT_ACTIVATION_CANDIDATE_SLOT": "",
-        "BINANCE_MARKET_DATA_API_KEY": "",
     }
     for name, exact in required.items():
         value = env.get(name, "")
@@ -1836,7 +1837,7 @@ class GitContext:
 class GitWriter:
     """Exact-parent, no-force writer for the isolated PIT branch."""
 
-    def __init__(self, repo: os.PathLike[str] | str, writer: str, branch: str = "pit-ledger-v1"):
+    def __init__(self, repo: os.PathLike[str] | str, writer: str, branch: str = "pit-ledger-public-v1"):
         self.repo, self.writer, self.branch = os.fspath(repo), writer, branch
 
     def git(self, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -2271,14 +2272,9 @@ class GitWriter:
         return self.recover_slot(h0, claim, now, expected_i_impl)
 
 
-def _live_send(source_id: str, url: str, api_key: str) -> tuple[int, bytes, dict[str, str]]:
+def _live_send(source_id: str, url: str) -> tuple[int, bytes, dict[str, str]]:
     validate_source_url(source_id, url)
-    headers = {}
-    if source_id in READ_ONLY_SOURCES:
-        if not api_key:
-            raise PitError("STOP_PERMISSION_REQUIRED")
-        headers["X-MBX-APIKEY"] = api_key
-    request = urllib.request.Request(url, method="GET", headers=headers)
+    request = urllib.request.Request(url, method="GET")
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
             return response.status, response.read(), dict(response.headers)
@@ -2367,7 +2363,7 @@ def live_capture() -> None:
 
     parsed = acquire_fixture_sources(
         ledger, claim,
-        lambda source_id, url: _live_send(source_id, url, env["BINANCE_MARKET_DATA_API_KEY"]),
+        _live_send,
         lambda: datetime.now(timezone.utc), durable, time.sleep, False,
     )
     if "__outcome__" in parsed:
@@ -2389,7 +2385,7 @@ def live_capture() -> None:
     print("PUBLISHED_SLOT_OUTCOME" if status == "PUBLISHED" else "DUPLICATE_NO_WRITE")
 
 
-def oracle_objects() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+def oracle_objects() -> tuple[dict[str, Any], ...]:
     return (
         universe_gap("QA_FAILURE"),
         funding_schema_failure("BN_FUT_PREMIUM_INDEX"),
@@ -2401,6 +2397,23 @@ def oracle_objects() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
                 {"symbol": "BTCUSDT", "baseAsset": "BTC", "quoteAsset": "USDT", "contractType": "PERPETUAL", "status": "TRADING"},
             ],
         ),
+        {
+            "borrowable": None, "mapping_status": "MAPPED",
+            "missing_reasons": ["NOT_APPLICABLE_NO_PERP", "NOT_OBSERVED_PUBLIC_ONLY"],
+            "perp_exists": False, "reason_codes": [], "venue": "BINANCE_USDM",
+        },
+        {
+            "borrowable": None, "mapping_status": "MAPPED",
+            "missing_reasons": ["NOT_OBSERVED_PUBLIC_ONLY", "SOURCE_FAILURE"],
+            "outcome_kind": "SNAPSHOT_PARTIAL", "perp_exists": None,
+            "reason_codes": ["SOURCE_FAILURE"], "slot_status": "PARTIAL", "venue": "BINANCE_USDM",
+        },
+        {
+            "borrowable": None, "mapping_status": "MAPPED",
+            "missing_reasons": ["NOT_OBSERVED_PUBLIC_ONLY", "SCHEMA_FAILURE"],
+            "outcome_kind": "SNAPSHOT_PARTIAL", "perp_exists": True,
+            "reason_codes": ["SCHEMA_FAILURE"], "slot_status": "PARTIAL", "venue": "BINANCE_USDM",
+        },
     )
 
 
@@ -2409,6 +2422,9 @@ def self_check() -> None:
         (242, "BB6A1F4C2A99D23E31C79809A1D25A38720A004831C34FE168EC681788EC2165"),
         (333, "8D13A204BDC833121A88F3C531B74A677987E0CE8A96C5610C9DA8C10CA2300D"),
         (257, "96701B35D8FC21BB3BD17BD3F27BA492E82C0959AEEEC9CB31BDDD58B7575CA4"),
+        (179, "C467F918C0C5948E83DD95484A4502306F8344CA0BAC8507946D73E1033035FE"),
+        (244, "C92039EC6CDBCB43F6210450CE969B230252AA700577FE77C8FF2D9149F4640A"),
+        (244, "4BC9C82E097C5348587C773DC0D6EA18C08D3A68A4FCAC1146A3A44BAD0AD8B6"),
     )
     for value, oracle in zip(oracle_objects(), expected):
         data = canonical_bytes(value)
@@ -2444,14 +2460,14 @@ def e2e_self_check() -> None:
         run(seed, "config", "user.name", "seed")
         run(seed, "config", "user.email", "seed@example.invalid")
         run(seed, "commit", "--allow-empty", "--quiet", "-m", "H0")
-        run(seed, "branch", "-M", "pit-ledger-v1")
+        run(seed, "branch", "-M", "pit-ledger-public-v1")
         run(seed, "remote", "add", "origin", remote)
-        run(seed, "push", "--quiet", "-u", "origin", "pit-ledger-v1")
+        run(seed, "push", "--quiet", "-u", "origin", "pit-ledger-public-v1")
         h0 = run(seed, "rev-parse", "HEAD")
         clones = []
         for name in ("a", "b", "wrong"):
             path = os.path.join(temp, name)
-            run(temp, "clone", "--quiet", "--branch", "pit-ledger-v1", remote, path)
+            run(temp, "clone", "--quiet", "--branch", "pit-ledger-public-v1", remote, path)
             run(path, "config", "user.name", "Actual Writer" if name == "wrong" else "PIT Ledger Writer")
             run(path, "config", "user.email", "actual@example.invalid" if name == "wrong" else "pit@example.invalid")
             clones.append(path)
@@ -2492,7 +2508,7 @@ def e2e_self_check() -> None:
         for source_id in SOURCE_ORDER[1:]:
             not_run = {
                 "I_impl": "A" * 64, "attempt_count": 0,
-                "auth_class": "READ_ONLY_MARKET_DATA" if source_id in READ_ONLY_SOURCES else "PUBLIC",
+                "auth_class": "PUBLIC",
                 "canonical_url_without_secret": URLS[source_id], "error_record_relative_path": None,
                 "error_record_sha256": None, "fetched_at_utc": None, "http_status": None,
                 "method": "GET", "page_ordinal": 0, "parse_status": "PARSE_NOT_RUN",
