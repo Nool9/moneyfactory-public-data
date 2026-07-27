@@ -157,6 +157,8 @@ class CanonicalTests(unittest.TestCase):
         for value in (
             {"raw_sha256": "a" * 64},
             {"x": [2, 1]},
+            [2, 1],
+            {"x": [[2, 1]]},
             {"files": [{"path": "z"}, {"path": "a"}]},
             {"available_raw_sha256s": ["B" * 64, "A" * 64]},
         ):
@@ -440,6 +442,19 @@ class WriterProtocolTests(unittest.TestCase):
             with self.assertRaises(p.PitError):
                 p.artifact_path(path)
 
+    def test_two_slots_have_disjoint_artifact_namespaces(self):
+        second_slot = p.add_slots(self.slot)
+        second = p.make_claim(second_slot, "A" * 64, self.writer, "H")
+        first_ledger, second_ledger = p.Ledger(self.writer), p.Ledger(self.writer)
+        first_ledger.claim(self.claim, self.writer, first_ledger.head)
+        second["value"]["expected_parent_before_claim"] = second_ledger.head
+        second_ledger.claim(second, self.writer, second_ledger.head)
+        first_path = first_ledger.archive_raw(self.key, "CG_TOP250", b"a")
+        second_path = second_ledger.archive_raw(second["value"]["idempotency_key"], "CG_TOP250", b"b")
+        self.assertNotEqual(first_path, second_path)
+        self.assertIn(p.claim_filesafe(self.slot), first_path)
+        self.assertIn(p.claim_filesafe(second_slot), second_path)
+
     def test_impl_change_requires_new_epoch_and_h0(self):
         p.ensure_impl_boundary("A", "A", p.EPOCH_ID, "H0")
         for args in (("A", "B", p.EPOCH_ID, "H0"), ("A", "A", "OLD", "H0"), ("A", "A", p.EPOCH_ID, "")):
@@ -452,6 +467,7 @@ class PermissionAndStaticTests(unittest.TestCase):
         digest = p.current_i_impl(Path(__file__).parent)
         full = {
             "PIT_ACTIVATION_APPROVED": "YES",
+            "PIT_ACTIVATION_CANDIDATE_SLOT": "2026-07-26T20:00:00.000Z",
             "PIT_TARGET_WRITE_APPROVED": "YES",
             "PIT_SECRET_APPROVED": "YES",
             "PIT_KEY_PERMISSION_PROOF": "READ_ONLY_MARKET_DATA_NO_TRADE_BORROW_TRANSFER_WITHDRAW",
@@ -497,6 +513,55 @@ class PermissionAndStaticTests(unittest.TestCase):
         required = {"claim_relative_path", "available_raw_count", "workflow_run_id", "job_id", "log_locator", "source_manifest_sha256s"}
         self.assertTrue(required.issubset(result["__outcome__"]))
 
+    def test_source_failure_window_handler_and_status_mapping_are_total(self):
+        writer, slot = "writer", "2026-07-26T20:00:00.000Z"
+
+        def claimed():
+            ledger = p.Ledger(writer)
+            claim = p.make_claim(slot, "A" * 64, writer, ledger.head)
+            self.assertEqual(ledger.claim(claim, writer, ledger.head), "CLAIMED")
+            return ledger, claim
+
+        ledger, claim = claimed()
+        result = p.acquire_fixture_sources(ledger, claim, lambda *_: (500, b"", {}))
+        self.assertEqual(len(result["__source_manifests__"]), 10)
+        self.assertEqual(result["__source_manifests__"][0]["source_status"], "SOURCE_FAILURE")
+        self.assertEqual(len(ledger.outcomes), 1)
+        self.assertEqual(result["__outcome__"]["outcome_kind"], "GAP_UNIVERSE")
+
+        ledger, claim = claimed()
+        times = iter((
+            datetime(2026, 7, 26, 20, 1, tzinfo=timezone.utc),
+            datetime(2026, 7, 26, 20, 1, tzinfo=timezone.utc),
+            datetime(2026, 7, 26, 20, 10, tzinfo=timezone.utc),
+        ))
+        result = p.acquire_fixture_sources(ledger, claim, lambda *_: (200, universe(), {}), lambda: next(times))
+        self.assertEqual(len(result["__source_manifests__"]), 10)
+        self.assertEqual(len(ledger.outcomes), 1)
+        self.assertEqual(result["__source_manifests__"][0]["source_status"], "SOURCE_FAILURE")
+
+        ledger, claim = claimed()
+        result = p.acquire_fixture_sources(ledger, claim, lambda *_: (_ for _ in ()).throw(RuntimeError("fixture")))
+        self.assertEqual(len(result["__source_manifests__"]), 10)
+        self.assertEqual(len(ledger.outcomes), 1)
+
+        ledger, claim = claimed()
+        inverted = universe(["100", "1", "50"] + [str(247 - i) for i in range(247)])
+        result = p.acquire_fixture_sources(ledger, claim, lambda *_: (200, inverted, {}))
+        first = result["__source_manifests__"][0]
+        self.assertEqual((first["parse_status"], first["qa_status"]), ("PARSE_OK", "QA_FAILURE"))
+
+        ledger, claim = claimed()
+        bodies = {
+            "CG_TOP250": universe(),
+            "BN_FUT_EXCHANGE_INFO": b'{"symbols":[]}',
+            "BN_FUT_PREMIUM_INDEX": b'[{"indexPrice":"bad","lastFundingRate":"NaN","markPrice":"bad","symbol":"BTCUSDT","time":-1}]',
+        }
+        result = p.acquire_fixture_sources(ledger, claim, lambda source, _: (200, bodies[source], {}))
+        premium = result["__source_manifests__"][2]
+        self.assertEqual((premium["parse_status"], premium["qa_status"]), ("SCHEMA_FAILURE", "QA_NOT_RUN"))
+        self.assertEqual(result["__outcome__"]["outcome_kind"], "SNAPSHOT_PARTIAL")
+
     def test_snapshot_semantic_witness_and_contextual_provenance(self):
         writer, slot = "writer", "2026-07-26T20:00:00.000Z"
         ledger = p.Ledger(writer)
@@ -513,12 +578,26 @@ class PermissionAndStaticTests(unittest.TestCase):
         }
         parsed = p.acquire_fixture_sources(ledger, claim, lambda source, _: (200, bodies[source], {}))
         snapshot = p.build_snapshot(bodies["CG_TOP250"], parsed, claim)
-        p.validate_snapshot(snapshot, claim, parsed["__source_manifests__"], {"writer_stop": False, "outcome_count": 1, "claim_before_request": True})
+        p.validate_snapshot(snapshot, claim, parsed["__source_manifests__"])
+        with self.assertRaises(p.PitError):
+            p.validate_snapshot(snapshot, claim, parsed["__source_manifests__"], {"writer_stop": False, "outcome_count": 1, "claim_before_request": True})
         broken = json.loads(json.dumps(snapshot))
         row = broken["assets"][0]["venues"][0]
-        row.update(mapping_status="MAPPED", exchange_symbol=None, perp_exists=False, funding_rate="0.1", bid_price="1", ask_price="2")
+        row.update(
+            mapping_status="MAPPED", exchange_symbol="X0USDT", perp_exists=None,
+            missing_reasons=["SCHEMA_FAILURE"], funding_rate="0.1",
+            funding_observed_at_utc="2026-07-26T20:00:00.000Z",
+            bid_price="1", ask_price="2", spread_bps="6666.66666667",
+            mark_price="1", index_price="1",
+        )
         with self.assertRaises(p.PitError):
             p.validate_snapshot(broken)
+        empty = json.loads(json.dumps(snapshot))
+        for asset in empty["assets"]:
+            for venue in asset["venues"]:
+                venue["source_raw_sha256s"] = []
+        with self.assertRaises(p.PitError):
+            p.validate_snapshot(empty, claim, parsed["__source_manifests__"])
 
     def test_schedule_and_branch_writer_are_frozen(self):
         workflow = (Path(__file__).parent / ".github/workflows/pit-ledger.yml").read_text()

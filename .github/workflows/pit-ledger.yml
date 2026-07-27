@@ -26,6 +26,7 @@ jobs:
         env:
           BINANCE_MARKET_DATA_API_KEY: ${{ secrets.BINANCE_MARKET_DATA_API_KEY }}
           PIT_ACTIVATION_APPROVED: ${{ vars.PIT_ACTIVATION_APPROVED }}
+          PIT_ACTIVATION_CANDIDATE_SLOT: ${{ vars.PIT_ACTIVATION_CANDIDATE_SLOT }}
           PIT_AUTHORIZED_WRITER: ${{ vars.PIT_AUTHORIZED_WRITER }}
           PIT_H0: ${{ vars.PIT_H0 }}
           PIT_I_IMPL: ${{ vars.PIT_I_IMPL }}
