@@ -1,6 +1,6 @@
-# PIT ledger public-only v4
+# PIT ledger public-only v5
 
-Pinned Cloud Run implementation for the PIT ledger public-only v4 contract.
+Pinned Cloud Run implementation for the PIT ledger public-only v5 contract.
 
 Checks:
 
@@ -11,7 +11,7 @@ python pit_ledger.py e2e-self-check
 git diff --check
 ```
 
-The container clones and writes only `pit-ledger-public-v4` and fails closed
+The container clones and writes only `pit-ledger-public-v5` and fails closed
 before market access unless every separately governed activation, target-write,
 writer, implementation, image, credential and epoch boundary is present.
 Each slot has an immutable namespace, real log/slot manifest, checkpoint and

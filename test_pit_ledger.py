@@ -1,3 +1,5 @@
+import base64
+import hashlib
 import json
 import os
 import subprocess
@@ -578,7 +580,7 @@ class PermissionAndStaticTests(unittest.TestCase):
             with self.assertRaises(p.PitError):
                 p.require_live_authorization(dict(full, PIT_I_IMPL=bad), Path(__file__).parent)
 
-    def test_cloud_run_emits_closed_non_secret_stage_token(self):
+    def test_cloud_run_and_ssh_keygen_fingerprint_witness(self):
         root = Path(__file__).parent
         full = {
             "PIT_ACTIVATION_APPROVED": "YES",
@@ -604,7 +606,7 @@ class PermissionAndStaticTests(unittest.TestCase):
             calls.append((args, kwargs))
             if args[:2] == ["ssh-keygen", "-y"]:
                 return subprocess.CompletedProcess(args, 0, "ssh-ed25519 AAAA\n", "")
-            if args[:2] == ["ssh-keygen", "-lf"]:
+            if args[:2] == ["ssh-keygen", "-l"]:
                 return subprocess.CompletedProcess(args, 0, "256 " + full["PIT_DEPLOY_KEY_FINGERPRINT"] + " key (ED25519)\n", "")
             if args[:2] == ["git", "clone"] or args[:3] == ["git", "merge-base", "--is-ancestor"]:
                 return subprocess.CompletedProcess(args, 0, "", "")
@@ -643,6 +645,22 @@ class PermissionAndStaticTests(unittest.TestCase):
         self.assertEqual(calls[-1][0][-1], "capture")
         self.assertTrue(calls[-1][1]["capture_output"])
         self.assertTrue(calls[-1][1]["text"])
+        with tempfile.TemporaryDirectory() as temp:
+            private = Path(temp, "id_ed25519")
+            generated = subprocess.run(
+                ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(private)],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(generated.returncode, 0, generated.stderr)
+            public = private.with_suffix(".pub")
+            argv = ["ssh-keygen", "-l", "-E", "sha256", "-f", str(public)]
+            result = subprocess.run(argv, capture_output=True, text=True, check=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.args, argv)
+            fingerprint = result.stdout.split()[1]
+            key_blob = base64.b64decode(public.read_text(encoding="ascii").split()[1])
+            expected = "SHA256:" + base64.b64encode(hashlib.sha256(key_blob).digest()).decode().rstrip("=")
+            self.assertEqual(fingerprint, expected)
 
     def test_manifest_recomputed_from_raw_bytes(self):
         root = Path(__file__).parent
@@ -1074,13 +1092,13 @@ class PermissionAndStaticTests(unittest.TestCase):
             )
         self.assertEqual(writer.recovered, [("2026-07-26T19:30:00.000Z", "A" * 64)])
 
-    def test_v4_container_and_branch_are_frozen(self):
+    def test_v5_container_and_branch_are_frozen(self):
         root = Path(__file__).parent
         docker = (root / "Dockerfile").read_text()
         self.assertFalse((root / ".github/workflows/pit-ledger.yml").exists())
-        self.assertEqual(p.CONTRACT_ID, "PIT_LEDGER_PUBLIC_ONLY_V4")
-        self.assertEqual(p.EPOCH_ID, "BASKET_PIT_LEDGER_TOP250_BINANCE_BYBIT_PUBLIC_V4")
-        self.assertEqual(p.GITHUB_BRANCH, "pit-ledger-public-v4")
+        self.assertEqual(p.CONTRACT_ID, "PIT_LEDGER_PUBLIC_ONLY_V5")
+        self.assertEqual(p.EPOCH_ID, "BASKET_PIT_LEDGER_TOP250_BINANCE_BYBIT_PUBLIC_V5")
+        self.assertEqual(p.GITHUB_BRANCH, "pit-ledger-public-v5")
         self.assertIn("FROM --platform=linux/amd64 python:3.12-slim-bookworm@sha256:8a7e7cc04fd3e2bd787f7f24e22d5d119aa590d429b50c95dfe12b3abe52f48b", docker)
         self.assertIn("COPY Dockerfile pit_ledger.py /app/", docker)
         self.assertIn('ENTRYPOINT ["python","/app/pit_ledger.py","cloud-run"]', docker)
