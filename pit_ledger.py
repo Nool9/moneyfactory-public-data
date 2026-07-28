@@ -24,12 +24,12 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Callable, Iterable
 
-CONTRACT_ID = "PIT_LEDGER_PUBLIC_ONLY_V3"
-EPOCH_ID = "BASKET_PIT_LEDGER_TOP250_BINANCE_BYBIT_PUBLIC_V3"
+CONTRACT_ID = "PIT_LEDGER_PUBLIC_ONLY_V4"
+EPOCH_ID = "BASKET_PIT_LEDGER_TOP250_BINANCE_BYBIT_PUBLIC_V4"
 PREFIX = f"pit_ledger/{EPOCH_ID}/"
 CONCURRENCY_GROUP = f"pit-ledger-{EPOCH_ID}"
 GITHUB_REPO = "git@github.com:Nool9/moneyfactory-public-data.git"
-GITHUB_BRANCH = "pit-ledger-public-v3"
+GITHUB_BRANCH = "pit-ledger-public-v4"
 AUTHORIZED_WRITER = "PIT Ledger Writer <pit-ledger@users.noreply.github.com>"
 SECRET_MOUNT = "/secrets/github/id_ed25519"
 KNOWN_HOSTS = "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl\n"
@@ -1300,7 +1300,7 @@ def artifact_path(relative: str) -> str:
         or relative.startswith("/")
         or ".." in relative.split("/")
         or not relative.startswith(PREFIX)
-        or "v4" in relative.lower()
+        or "collector_v4" in relative.lower()
     ):
         raise PitError("PATH_NOT_ALLOWED")
     return relative
@@ -1365,7 +1365,7 @@ def make_claim(
 def run_log_bytes(claim: dict[str, Any]) -> bytes:
     value = claim["value"]
     return (
-        "PIT_LEDGER_PUBLIC_ONLY_V3\n"
+        "PIT_LEDGER_PUBLIC_ONLY_V4\n"
         f"idempotency_key={value['idempotency_key']}\n"
         f"attempt_id={value['attempt_id']}\n"
         f"workflow_run_id={value['workflow_run_id']}\n"
@@ -2406,10 +2406,13 @@ def live_capture() -> None:
 def cloud_run() -> int:
     env = dict(os.environ)
     root = os.path.dirname(os.path.abspath(__file__))
+    stage = "STOP_PERMISSION_REQUIRED_AUTH"
     try:
+        stage = "STOP_PERMISSION_REQUIRED_AUTH"
         require_live_authorization(env, root)
+        stage = "STOP_PERMISSION_REQUIRED_SECRET_MOUNT"
         if not os.path.isfile(SECRET_MOUNT):
-            raise PitError("STOP_PERMISSION_REQUIRED")
+            raise PitError(stage)
         with tempfile.TemporaryDirectory(prefix="pit-ledger-cloud-run-") as temp:
             key_path = os.path.join(temp, "id_ed25519")
             public_path = key_path + ".pub"
@@ -2424,15 +2427,17 @@ def cloud_run() -> int:
                     text=True, check=False,
                 )
                 if result.returncode:
-                    raise PitError("STOP_PERMISSION_REQUIRED")
+                    raise PitError(stage)
                 return result.stdout.strip()
 
+            stage = "STOP_PERMISSION_REQUIRED_KEY_DERIVE"
             public = checked("ssh-keygen", "-y", "-f", key_path)
             with open(public_path, "w", encoding="ascii", newline="\n") as handle:
                 handle.write(public + "\n")
+            stage = "STOP_PERMISSION_REQUIRED_KEY_FINGERPRINT"
             fingerprint = checked("ssh-keygen", "-lf", "-E", "sha256", public_path).split()
             if len(fingerprint) < 2 or fingerprint[1] != env["PIT_DEPLOY_KEY_FINGERPRINT"]:
-                raise PitError("STOP_PERMISSION_REQUIRED")
+                raise PitError(stage)
             with open(known_hosts_path, "w", encoding="ascii", newline="\n") as handle:
                 handle.write(KNOWN_HOSTS)
             ssh_command = (
@@ -2441,17 +2446,20 @@ def cloud_run() -> int:
                 + " -o StrictHostKeyChecking=yes"
             )
             child_env = dict(env, GIT_SSH_COMMAND=ssh_command)
+            stage = "STOP_PERMISSION_REQUIRED_CLONE"
             checked(
                 "git", "clone", "--quiet", "--branch", GITHUB_BRANCH,
                 "--single-branch", GITHUB_REPO, clone_path, run_env=child_env,
             )
+            stage = "STOP_PERMISSION_REQUIRED_BINDING"
             checked("git", "merge-base", "--is-ancestor", env["PIT_H0"], "HEAD", cwd=clone_path)
             if (
                 checked("git", "branch", "--show-current", cwd=clone_path) != GITHUB_BRANCH
                 or checked("git", "remote", "get-url", "origin", cwd=clone_path) != GITHUB_REPO
                 or current_i_impl(clone_path) != env["PIT_I_IMPL"]
             ):
-                raise PitError("STOP_PERMISSION_REQUIRED")
+                raise PitError(stage)
+            stage = "STOP_PERMISSION_REQUIRED_WRITER_ID"
             checked("git", "config", "user.name", "PIT Ledger Writer", cwd=clone_path)
             checked("git", "config", "user.email", "pit-ledger@users.noreply.github.com", cwd=clone_path)
             if (
@@ -2459,16 +2467,17 @@ def cloud_run() -> int:
                 + checked("git", "config", "user.email", cwd=clone_path) + ">"
                 != AUTHORIZED_WRITER
             ):
-                raise PitError("STOP_PERMISSION_REQUIRED")
+                raise PitError(stage)
+            stage = "STOP_PERMISSION_REQUIRED_CAPTURE"
             result = subprocess.run(
                 [sys.executable, os.path.join(clone_path, "pit_ledger.py"), "capture"],
-                cwd=clone_path, env=child_env, check=False,
+                cwd=clone_path, env=child_env, capture_output=True, text=True, check=False,
             )
             if result.returncode:
-                raise PitError("STOP_PERMISSION_REQUIRED")
+                raise PitError(stage)
             return 0
-    except (OSError, UnicodeError, IndexError, PitError):
-        raise PitError("STOP_PERMISSION_REQUIRED") from None
+    except Exception:
+        raise PitError(stage) from None
 
 
 def oracle_objects() -> tuple[dict[str, Any], ...]:

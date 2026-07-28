@@ -578,7 +578,7 @@ class PermissionAndStaticTests(unittest.TestCase):
             with self.assertRaises(p.PitError):
                 p.require_live_authorization(dict(full, PIT_I_IMPL=bad), Path(__file__).parent)
 
-    def test_cloud_run_env_and_fingerprint_fail_before_clone(self):
+    def test_cloud_run_emits_closed_non_secret_stage_token(self):
         root = Path(__file__).parent
         full = {
             "PIT_ACTIVATION_APPROVED": "YES",
@@ -598,29 +598,51 @@ class PermissionAndStaticTests(unittest.TestCase):
         }
         calls = []
 
-        def offline_run(args, **_):
-            calls.append(args)
-            stdout = "ssh-ed25519 AAAA\n" if args[1] == "-y" else "256 SHA256:" + "D" * 43 + " key (ED25519)\n"
-            return subprocess.CompletedProcess(args, 0, stdout, "")
+        secret = "PRIVATE_KEY_SHOULD_NOT_LEAK"
+
+        def offline_run(args, **kwargs):
+            calls.append((args, kwargs))
+            if args[:2] == ["ssh-keygen", "-y"]:
+                return subprocess.CompletedProcess(args, 0, "ssh-ed25519 AAAA\n", "")
+            if args[:2] == ["ssh-keygen", "-lf"]:
+                return subprocess.CompletedProcess(args, 0, "256 " + full["PIT_DEPLOY_KEY_FINGERPRINT"] + " key (ED25519)\n", "")
+            if args[:2] == ["git", "clone"] or args[:3] == ["git", "merge-base", "--is-ancestor"]:
+                return subprocess.CompletedProcess(args, 0, "", "")
+            if args[:3] == ["git", "branch", "--show-current"]:
+                return subprocess.CompletedProcess(args, 0, p.GITHUB_BRANCH + "\n", "")
+            if args[:3] == ["git", "remote", "get-url"]:
+                return subprocess.CompletedProcess(args, 0, p.GITHUB_REPO + "\n", "")
+            if args[:3] == ["git", "config", "user.name"]:
+                return subprocess.CompletedProcess(args, 0, "PIT Ledger Writer\n" if len(args) == 3 else "", "")
+            if args[:3] == ["git", "config", "user.email"]:
+                return subprocess.CompletedProcess(args, 0, "pit-ledger@users.noreply.github.com\n" if len(args) == 3 else "", "")
+            if args[-1] == "capture":
+                return subprocess.CompletedProcess(args, 1, secret, secret)
+            raise AssertionError(args)
 
         with (
             patch.dict(os.environ, {}, clear=True),
             patch.object(p.subprocess, "run") as no_call,
-            self.assertRaisesRegex(p.PitError, "STOP_PERMISSION_REQUIRED"),
+            self.assertRaisesRegex(p.PitError, "^STOP_PERMISSION_REQUIRED_AUTH$"),
         ):
             p.cloud_run()
         no_call.assert_not_called()
         with tempfile.TemporaryDirectory() as temp:
-            secret = Path(temp, "id_ed25519")
-            secret.write_bytes(b"private fixture")
+            key = Path(temp, "id_ed25519")
+            key.write_bytes(b"private fixture")
             with (
                 patch.dict(os.environ, full, clear=True),
-                patch.object(p, "SECRET_MOUNT", str(secret)),
+                patch.object(p, "SECRET_MOUNT", str(key)),
+                patch.object(p, "current_i_impl", return_value=full["PIT_I_IMPL"]),
                 patch.object(p.subprocess, "run", side_effect=offline_run),
-                self.assertRaisesRegex(p.PitError, "STOP_PERMISSION_REQUIRED"),
+                self.assertRaises(p.PitError) as raised,
             ):
                 p.cloud_run()
-        self.assertEqual([call[0] for call in calls], ["ssh-keygen", "ssh-keygen"])
+        self.assertEqual(str(raised.exception), "STOP_PERMISSION_REQUIRED_CAPTURE")
+        self.assertNotIn(secret, str(raised.exception))
+        self.assertEqual(calls[-1][0][-1], "capture")
+        self.assertTrue(calls[-1][1]["capture_output"])
+        self.assertTrue(calls[-1][1]["text"])
 
     def test_manifest_recomputed_from_raw_bytes(self):
         root = Path(__file__).parent
@@ -1052,13 +1074,13 @@ class PermissionAndStaticTests(unittest.TestCase):
             )
         self.assertEqual(writer.recovered, [("2026-07-26T19:30:00.000Z", "A" * 64)])
 
-    def test_v3_container_and_branch_are_frozen(self):
+    def test_v4_container_and_branch_are_frozen(self):
         root = Path(__file__).parent
         docker = (root / "Dockerfile").read_text()
         self.assertFalse((root / ".github/workflows/pit-ledger.yml").exists())
-        self.assertEqual(p.CONTRACT_ID, "PIT_LEDGER_PUBLIC_ONLY_V3")
-        self.assertEqual(p.EPOCH_ID, "BASKET_PIT_LEDGER_TOP250_BINANCE_BYBIT_PUBLIC_V3")
-        self.assertEqual(p.GITHUB_BRANCH, "pit-ledger-public-v3")
+        self.assertEqual(p.CONTRACT_ID, "PIT_LEDGER_PUBLIC_ONLY_V4")
+        self.assertEqual(p.EPOCH_ID, "BASKET_PIT_LEDGER_TOP250_BINANCE_BYBIT_PUBLIC_V4")
+        self.assertEqual(p.GITHUB_BRANCH, "pit-ledger-public-v4")
         self.assertIn("FROM --platform=linux/amd64 python:3.12-slim-bookworm@sha256:8a7e7cc04fd3e2bd787f7f24e22d5d119aa590d429b50c95dfe12b3abe52f48b", docker)
         self.assertIn("COPY Dockerfile pit_ledger.py /app/", docker)
         self.assertIn('ENTRYPOINT ["python","/app/pit_ledger.py","cloud-run"]', docker)
