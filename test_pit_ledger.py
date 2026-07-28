@@ -3,6 +3,7 @@ import os
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 from datetime import datetime, timezone
 from decimal import Decimal, localcontext
 from pathlib import Path
@@ -387,7 +388,7 @@ class DerivationAndSourceTests(unittest.TestCase):
         self.assertEqual(p.ENUMS["auth_class"], {"PUBLIC"})
         production = (
             Path(p.__file__).read_text()
-            + (Path(__file__).parent / ".github/workflows/pit-ledger.yml").read_text()
+            + (Path(__file__).parent / "Dockerfile").read_text()
         )
         for forbidden in (
             "BN_MARGIN_ASSETS", "BN_MARGIN_PAIRS", "READ_ONLY_MARKET_DATA",
@@ -555,9 +556,17 @@ class PermissionAndStaticTests(unittest.TestCase):
             "PIT_ACTIVATION_APPROVED": "YES",
             "PIT_ACTIVATION_CANDIDATE_SLOT": "2026-07-26T20:00:00.000Z",
             "PIT_TARGET_WRITE_APPROVED": "YES",
-            "PIT_AUTHORIZED_WRITER": "writer",
+            "PIT_AUTHORIZED_WRITER": p.AUTHORIZED_WRITER,
+            "PIT_GITHUB_REPO": p.GITHUB_REPO,
+            "PIT_GITHUB_BRANCH": p.GITHUB_BRANCH,
             "PIT_I_IMPL": digest,
-            "PIT_H0": "H0",
+            "PIT_H0": "a" * 40,
+            "PIT_IMAGE_DIGEST": "sha256:" + "b" * 64,
+            "PIT_DEPLOY_KEY_FINGERPRINT": "SHA256:" + "C" * 43,
+            "CLOUD_RUN_EXECUTION": "pit-ledger-abcde",
+            "CLOUD_RUN_JOB": "pit-ledger",
+            "CLOUD_RUN_TASK_INDEX": "0",
+            "CLOUD_RUN_TASK_ATTEMPT": "0",
         }
         p.require_live_authorization(full, Path(__file__).parent)
         for name in tuple(full):
@@ -568,6 +577,50 @@ class PermissionAndStaticTests(unittest.TestCase):
         for bad in ("A", "0" * 64):
             with self.assertRaises(p.PitError):
                 p.require_live_authorization(dict(full, PIT_I_IMPL=bad), Path(__file__).parent)
+
+    def test_cloud_run_env_and_fingerprint_fail_before_clone(self):
+        root = Path(__file__).parent
+        full = {
+            "PIT_ACTIVATION_APPROVED": "YES",
+            "PIT_ACTIVATION_CANDIDATE_SLOT": "2026-07-26T20:00:00.000Z",
+            "PIT_TARGET_WRITE_APPROVED": "YES",
+            "PIT_AUTHORIZED_WRITER": p.AUTHORIZED_WRITER,
+            "PIT_GITHUB_REPO": p.GITHUB_REPO,
+            "PIT_GITHUB_BRANCH": p.GITHUB_BRANCH,
+            "PIT_I_IMPL": p.current_i_impl(root),
+            "PIT_H0": "a" * 40,
+            "PIT_IMAGE_DIGEST": "sha256:" + "b" * 64,
+            "PIT_DEPLOY_KEY_FINGERPRINT": "SHA256:" + "C" * 43,
+            "CLOUD_RUN_EXECUTION": "pit-ledger-abcde",
+            "CLOUD_RUN_JOB": "pit-ledger",
+            "CLOUD_RUN_TASK_INDEX": "0",
+            "CLOUD_RUN_TASK_ATTEMPT": "0",
+        }
+        calls = []
+
+        def offline_run(args, **_):
+            calls.append(args)
+            stdout = "ssh-ed25519 AAAA\n" if args[1] == "-y" else "256 SHA256:" + "D" * 43 + " key (ED25519)\n"
+            return subprocess.CompletedProcess(args, 0, stdout, "")
+
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(p.subprocess, "run") as no_call,
+            self.assertRaisesRegex(p.PitError, "STOP_PERMISSION_REQUIRED"),
+        ):
+            p.cloud_run()
+        no_call.assert_not_called()
+        with tempfile.TemporaryDirectory() as temp:
+            secret = Path(temp, "id_ed25519")
+            secret.write_bytes(b"private fixture")
+            with (
+                patch.dict(os.environ, full, clear=True),
+                patch.object(p, "SECRET_MOUNT", str(secret)),
+                patch.object(p.subprocess, "run", side_effect=offline_run),
+                self.assertRaisesRegex(p.PitError, "STOP_PERMISSION_REQUIRED"),
+            ):
+                p.cloud_run()
+        self.assertEqual([call[0] for call in calls], ["ssh-keygen", "ssh-keygen"])
 
     def test_manifest_recomputed_from_raw_bytes(self):
         root = Path(__file__).parent
@@ -757,9 +810,9 @@ class PermissionAndStaticTests(unittest.TestCase):
             git(repo, "config", "user.name", "seed")
             git(repo, "config", "user.email", "seed@example.invalid")
             git(repo, "commit", "--allow-empty", "--quiet", "-m", "H0")
-            git(repo, "branch", "-M", "pit-ledger-public-v2")
+            git(repo, "branch", "-M", p.GITHUB_BRANCH)
             git(repo, "remote", "add", "origin", str(remote))
-            git(repo, "push", "--quiet", "-u", "origin", "pit-ledger-public-v2")
+            git(repo, "push", "--quiet", "-u", "origin", p.GITHUB_BRANCH)
             h0 = git(repo, "rev-parse", "HEAD")
             git(repo, "config", "user.name", "PIT Ledger Writer")
             git(repo, "config", "user.email", "pit@example.invalid")
@@ -999,54 +1052,16 @@ class PermissionAndStaticTests(unittest.TestCase):
             )
         self.assertEqual(writer.recovered, [("2026-07-26T19:30:00.000Z", "A" * 64)])
 
-    def test_v2_bootstrap_matrix_and_normalized_parent_equivalence(self):
+    def test_v3_container_and_branch_are_frozen(self):
         root = Path(__file__).parent
-        parent = "047f3a4a265021e3879b784bbe05abdb804213ea"
-        replacements = (
-            (b"PIT_LEDGER_PUBLIC_ONLY_V1", b"PIT_LEDGER_PUBLIC_ONLY_V2"),
-            (b"BASKET_PIT_LEDGER_TOP250_BINANCE_BYBIT_PUBLIC_V1", b"BASKET_PIT_LEDGER_TOP250_BINANCE_BYBIT_PUBLIC_V2"),
-            (b"pit-ledger-public-v1", b"pit-ledger-public-v2"),
-        )
-
-        def normalized_parent(path):
-            data = subprocess.run(
-                ["git", "show", f"{parent}:{path}"], cwd=root, capture_output=True, check=True
-            ).stdout
-            for old, new in replacements:
-                data = data.replace(old, new)
-            return data
-
-        self.assertEqual((root / "pit_ledger.py").read_bytes(), normalized_parent("pit_ledger.py"))
-        self.assertEqual((root / "README.md").read_bytes(), normalized_parent("README.md"))
-        expected_workflow = normalized_parent(".github/workflows/pit-ledger.yml").decode()
-        expected_workflow = expected_workflow.replace(
-            "on:\n  schedule:", "on:\n  workflow_dispatch:\n  schedule:", 1
-        ).replace(
-            "  capture:\n    runs-on:",
-            "  capture:\n"
-            "    if: >-\n"
-            "      (github.event_name == 'workflow_dispatch' && vars.PIT_BOOTSTRAP_MODE == 'MANUAL_S0') ||\n"
-            "      (github.event_name == 'schedule' && vars.PIT_BOOTSTRAP_MODE == 'SCHEDULED')\n"
-            "    runs-on:",
-            1,
-        )
-        workflow = (root / ".github/workflows/pit-ledger.yml").read_text()
-        self.assertEqual(workflow, expected_workflow)
-        allowed = {("workflow_dispatch", "MANUAL_S0"), ("schedule", "SCHEDULED")}
-        for event in ("workflow_dispatch", "schedule", "push", "UNKNOWN"):
-            for mode in ("MANUAL_S0", "SCHEDULED", "UNKNOWN", ""):
-                should_run = (
-                    event == "workflow_dispatch" and mode == "MANUAL_S0"
-                ) or (event == "schedule" and mode == "SCHEDULED")
-                self.assertEqual(should_run, (event, mode) in allowed)
-
-    def test_schedule_and_branch_writer_are_frozen(self):
-        workflow = (Path(__file__).parent / ".github/workflows/pit-ledger.yml").read_text()
-        self.assertIn('cron: "2,32 * * * *"', workflow)
-        self.assertIn("ref: pit-ledger-public-v2", workflow)
-        self.assertIn("contents: write", workflow)
-        self.assertIn("HEAD:refs/heads/pit-ledger-public-v2", workflow)
-        self.assertNotIn("secrets.", workflow)
+        docker = (root / "Dockerfile").read_text()
+        self.assertFalse((root / ".github/workflows/pit-ledger.yml").exists())
+        self.assertEqual(p.CONTRACT_ID, "PIT_LEDGER_PUBLIC_ONLY_V3")
+        self.assertEqual(p.EPOCH_ID, "BASKET_PIT_LEDGER_TOP250_BINANCE_BYBIT_PUBLIC_V3")
+        self.assertEqual(p.GITHUB_BRANCH, "pit-ledger-public-v3")
+        self.assertIn("FROM --platform=linux/amd64 python:3.12-slim-bookworm@sha256:8a7e7cc04fd3e2bd787f7f24e22d5d119aa590d429b50c95dfe12b3abe52f48b", docker)
+        self.assertIn("COPY Dockerfile pit_ledger.py /app/", docker)
+        self.assertIn('ENTRYPOINT ["python","/app/pit_ledger.py","cloud-run"]', docker)
         p.acquisition_window("2026-07-26T20:00:00.000Z", datetime(2026, 7, 26, 20, 2, tzinfo=timezone.utc))
         p.acquisition_window("2026-07-26T20:30:00.000Z", datetime(2026, 7, 26, 20, 32, tzinfo=timezone.utc))
         for now in (datetime(2026, 7, 26, 19, 59, tzinfo=timezone.utc), datetime(2026, 7, 26, 20, 10, tzinfo=timezone.utc)):

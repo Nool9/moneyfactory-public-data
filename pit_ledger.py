@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -23,10 +24,15 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Callable, Iterable
 
-CONTRACT_ID = "PIT_LEDGER_PUBLIC_ONLY_V2"
-EPOCH_ID = "BASKET_PIT_LEDGER_TOP250_BINANCE_BYBIT_PUBLIC_V2"
+CONTRACT_ID = "PIT_LEDGER_PUBLIC_ONLY_V3"
+EPOCH_ID = "BASKET_PIT_LEDGER_TOP250_BINANCE_BYBIT_PUBLIC_V3"
 PREFIX = f"pit_ledger/{EPOCH_ID}/"
 CONCURRENCY_GROUP = f"pit-ledger-{EPOCH_ID}"
+GITHUB_REPO = "git@github.com:Nool9/moneyfactory-public-data.git"
+GITHUB_BRANCH = "pit-ledger-public-v3"
+AUTHORIZED_WRITER = "PIT Ledger Writer <pit-ledger@users.noreply.github.com>"
+SECRET_MOUNT = "/secrets/github/id_ed25519"
+KNOWN_HOSTS = "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl\n"
 VENUES = ("BINANCE_USDM", "BYBIT_LINEAR")
 SOURCE_ORDER = (
     "CG_TOP250",
@@ -131,7 +137,7 @@ DECIMAL_RE = re.compile(r"^-?(?:0|[1-9]\d*)(?:\.\d+)?$")
 FORBIDDEN_FIELDS = {"reason", "message", "detail", "diagnostic"}
 MAX_UNIX_MS = 253402300799999
 SHA256_RE = re.compile(r"^[0-9A-F]{64}$")
-IMPLEMENTATION_FILES = (".github/workflows/pit-ledger.yml", "pit_ledger.py")
+IMPLEMENTATION_FILES = ("Dockerfile", "pit_ledger.py")
 LEDGER_INDEX_PATH = PREFIX + "ledger/index.jsonl"
 
 
@@ -1359,7 +1365,7 @@ def make_claim(
 def run_log_bytes(claim: dict[str, Any]) -> bytes:
     value = claim["value"]
     return (
-        "PIT_LEDGER_PUBLIC_ONLY_V2\n"
+        "PIT_LEDGER_PUBLIC_ONLY_V3\n"
         f"idempotency_key={value['idempotency_key']}\n"
         f"attempt_id={value['attempt_id']}\n"
         f"workflow_run_id={value['workflow_run_id']}\n"
@@ -1805,16 +1811,29 @@ def require_live_authorization(env: dict[str, str], root: os.PathLike[str] | str
     required = {
         "PIT_ACTIVATION_APPROVED": "YES",
         "PIT_TARGET_WRITE_APPROVED": "YES",
-        "PIT_AUTHORIZED_WRITER": "",
+        "PIT_AUTHORIZED_WRITER": AUTHORIZED_WRITER,
+        "PIT_GITHUB_REPO": GITHUB_REPO,
+        "PIT_GITHUB_BRANCH": GITHUB_BRANCH,
         "PIT_I_IMPL": "",
         "PIT_H0": "",
         "PIT_ACTIVATION_CANDIDATE_SLOT": "",
+        "PIT_IMAGE_DIGEST": "",
+        "PIT_DEPLOY_KEY_FINGERPRINT": "",
+        "CLOUD_RUN_EXECUTION": "",
+        "CLOUD_RUN_JOB": "",
+        "CLOUD_RUN_TASK_INDEX": "0",
+        "CLOUD_RUN_TASK_ATTEMPT": "0",
     }
     for name, exact in required.items():
         value = env.get(name, "")
         if not value or exact and value != exact:
             raise PitError("STOP_PERMISSION_REQUIRED")
-    if not SHA256_RE.fullmatch(env["PIT_I_IMPL"]):
+    if (
+        not SHA256_RE.fullmatch(env["PIT_I_IMPL"])
+        or not re.fullmatch(r"[0-9a-f]{40}", env["PIT_H0"])
+        or not re.fullmatch(r"sha256:[0-9a-f]{64}", env["PIT_IMAGE_DIGEST"])
+        or not re.fullmatch(r"SHA256:[A-Za-z0-9+/]{43}", env["PIT_DEPLOY_KEY_FINGERPRINT"])
+    ):
         raise PitError("STOP_PERMISSION_REQUIRED")
     validate_utc(env["PIT_ACTIVATION_CANDIDATE_SLOT"])
     ensure_impl_boundary(env["PIT_I_IMPL"], current_i_impl(root), EPOCH_ID, env["PIT_H0"])
@@ -1837,7 +1856,7 @@ class GitContext:
 class GitWriter:
     """Exact-parent, no-force writer for the isolated PIT branch."""
 
-    def __init__(self, repo: os.PathLike[str] | str, writer: str, branch: str = "pit-ledger-public-v2"):
+    def __init__(self, repo: os.PathLike[str] | str, writer: str, branch: str = GITHUB_BRANCH):
         self.repo, self.writer, self.branch = os.fspath(repo), writer, branch
 
     def git(self, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -2326,8 +2345,8 @@ def live_capture() -> None:
     writer.verify_history(env["PIT_H0"], head)
     head = prepare_live_slot(
         writer, env["PIT_H0"], env["PIT_ACTIVATION_CANDIDATE_SLOT"], slot, now,
-        env["PIT_I_IMPL"], writer_id, env.get("GITHUB_RUN_ID", "recovery-run"),
-        env.get("GITHUB_JOB", "capture"),
+        env["PIT_I_IMPL"], writer_id, env["CLOUD_RUN_EXECUTION"],
+        env["CLOUD_RUN_JOB"],
     )
     key = EPOCH_ID + "|" + slot
     outcome_path = artifact_path(PREFIX + "outcomes/" + claim_filesafe(slot) + ".json")
@@ -2337,8 +2356,7 @@ def live_capture() -> None:
     claim = make_claim(
         slot, env["PIT_I_IMPL"], writer_id, head,
         now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z",
-        env.get("GITHUB_RUN_ID", "local-run"), env.get("GITHUB_JOB", "capture"),
-        env.get("GITHUB_SERVER_URL", "") + "/" + env.get("GITHUB_REPOSITORY", "") + "/actions/runs/" + env.get("GITHUB_RUN_ID", "local-run"),
+        env["CLOUD_RUN_EXECUTION"], env["CLOUD_RUN_JOB"],
     )
     key, claim_path = claim["value"]["idempotency_key"], claim["relative_path"]
     if not writer.history_absent(env["PIT_H0"], head, claim_path):
@@ -2383,6 +2401,74 @@ def live_capture() -> None:
         manifests = sorted(context.source_manifests.values(), key=lambda item: (SOURCE_ORDER.index(item["source_id"]), item["page_ordinal"]))
         validate_snapshot(final, claim, manifests, context, True, env["PIT_I_IMPL"])
     print("PUBLISHED_SLOT_OUTCOME" if status == "PUBLISHED" else "DUPLICATE_NO_WRITE")
+
+
+def cloud_run() -> int:
+    env = dict(os.environ)
+    root = os.path.dirname(os.path.abspath(__file__))
+    try:
+        require_live_authorization(env, root)
+        if not os.path.isfile(SECRET_MOUNT):
+            raise PitError("STOP_PERMISSION_REQUIRED")
+        with tempfile.TemporaryDirectory(prefix="pit-ledger-cloud-run-") as temp:
+            key_path = os.path.join(temp, "id_ed25519")
+            public_path = key_path + ".pub"
+            known_hosts_path = os.path.join(temp, "known_hosts")
+            clone_path = os.path.join(temp, "repo")
+            shutil.copyfile(SECRET_MOUNT, key_path)
+            os.chmod(key_path, 0o600)
+
+            def checked(*args: str, cwd: str | None = None, run_env: dict[str, str] | None = None) -> str:
+                result = subprocess.run(
+                    list(args), cwd=cwd, env=run_env, capture_output=True,
+                    text=True, check=False,
+                )
+                if result.returncode:
+                    raise PitError("STOP_PERMISSION_REQUIRED")
+                return result.stdout.strip()
+
+            public = checked("ssh-keygen", "-y", "-f", key_path)
+            with open(public_path, "w", encoding="ascii", newline="\n") as handle:
+                handle.write(public + "\n")
+            fingerprint = checked("ssh-keygen", "-lf", "-E", "sha256", public_path).split()
+            if len(fingerprint) < 2 or fingerprint[1] != env["PIT_DEPLOY_KEY_FINGERPRINT"]:
+                raise PitError("STOP_PERMISSION_REQUIRED")
+            with open(known_hosts_path, "w", encoding="ascii", newline="\n") as handle:
+                handle.write(KNOWN_HOSTS)
+            ssh_command = (
+                "ssh -i " + shlex.quote(key_path)
+                + " -o IdentitiesOnly=yes -o UserKnownHostsFile=" + shlex.quote(known_hosts_path)
+                + " -o StrictHostKeyChecking=yes"
+            )
+            child_env = dict(env, GIT_SSH_COMMAND=ssh_command)
+            checked(
+                "git", "clone", "--quiet", "--branch", GITHUB_BRANCH,
+                "--single-branch", GITHUB_REPO, clone_path, run_env=child_env,
+            )
+            checked("git", "merge-base", "--is-ancestor", env["PIT_H0"], "HEAD", cwd=clone_path)
+            if (
+                checked("git", "branch", "--show-current", cwd=clone_path) != GITHUB_BRANCH
+                or checked("git", "remote", "get-url", "origin", cwd=clone_path) != GITHUB_REPO
+                or current_i_impl(clone_path) != env["PIT_I_IMPL"]
+            ):
+                raise PitError("STOP_PERMISSION_REQUIRED")
+            checked("git", "config", "user.name", "PIT Ledger Writer", cwd=clone_path)
+            checked("git", "config", "user.email", "pit-ledger@users.noreply.github.com", cwd=clone_path)
+            if (
+                checked("git", "config", "user.name", cwd=clone_path) + " <"
+                + checked("git", "config", "user.email", cwd=clone_path) + ">"
+                != AUTHORIZED_WRITER
+            ):
+                raise PitError("STOP_PERMISSION_REQUIRED")
+            result = subprocess.run(
+                [sys.executable, os.path.join(clone_path, "pit_ledger.py"), "capture"],
+                cwd=clone_path, env=child_env, check=False,
+            )
+            if result.returncode:
+                raise PitError("STOP_PERMISSION_REQUIRED")
+            return 0
+    except (OSError, UnicodeError, IndexError, PitError):
+        raise PitError("STOP_PERMISSION_REQUIRED") from None
 
 
 def oracle_objects() -> tuple[dict[str, Any], ...]:
@@ -2460,14 +2546,14 @@ def e2e_self_check() -> None:
         run(seed, "config", "user.name", "seed")
         run(seed, "config", "user.email", "seed@example.invalid")
         run(seed, "commit", "--allow-empty", "--quiet", "-m", "H0")
-        run(seed, "branch", "-M", "pit-ledger-public-v2")
+        run(seed, "branch", "-M", GITHUB_BRANCH)
         run(seed, "remote", "add", "origin", remote)
-        run(seed, "push", "--quiet", "-u", "origin", "pit-ledger-public-v2")
+        run(seed, "push", "--quiet", "-u", "origin", GITHUB_BRANCH)
         h0 = run(seed, "rev-parse", "HEAD")
         clones = []
         for name in ("a", "b", "wrong"):
             path = os.path.join(temp, name)
-            run(temp, "clone", "--quiet", "--branch", "pit-ledger-public-v2", remote, path)
+            run(temp, "clone", "--quiet", "--branch", GITHUB_BRANCH, remote, path)
             run(path, "config", "user.name", "Actual Writer" if name == "wrong" else "PIT Ledger Writer")
             run(path, "config", "user.email", "actual@example.invalid" if name == "wrong" else "pit@example.invalid")
             clones.append(path)
@@ -2623,10 +2709,12 @@ def main(argv: list[str]) -> int:
     if argv in (["workflow"], ["capture"]):
         live_capture()
         return 0
+    if argv == ["cloud-run"]:
+        return cloud_run()
     if argv == ["e2e-self-check"]:
         e2e_self_check()
         return 0
-    print("usage: pit_ledger.py self-check|e2e-self-check|workflow", file=sys.stderr)
+    print("usage: pit_ledger.py self-check|e2e-self-check|capture|cloud-run", file=sys.stderr)
     return 2
 
 
