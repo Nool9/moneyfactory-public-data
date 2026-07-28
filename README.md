@@ -12,7 +12,7 @@ git diff --check
 ```
 
 The workflow is a thin `schedule` wrapper installed on the default branch. It
-checks out and writes only `pit-ledger-public-v1` and fails closed
+checks out and writes only `pit-ledger-public-v2` and fails closed
 before network access unless every separately governed activation, target-write,
 writer, implementation and epoch boundary is present.
 Each slot has an immutable namespace, real log/slot manifest, checkpoint and

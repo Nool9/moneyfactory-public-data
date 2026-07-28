@@ -23,8 +23,8 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Callable, Iterable
 
-CONTRACT_ID = "PIT_LEDGER_PUBLIC_ONLY_V1"
-EPOCH_ID = "BASKET_PIT_LEDGER_TOP250_BINANCE_BYBIT_PUBLIC_V1"
+CONTRACT_ID = "PIT_LEDGER_PUBLIC_ONLY_V2"
+EPOCH_ID = "BASKET_PIT_LEDGER_TOP250_BINANCE_BYBIT_PUBLIC_V2"
 PREFIX = f"pit_ledger/{EPOCH_ID}/"
 CONCURRENCY_GROUP = f"pit-ledger-{EPOCH_ID}"
 VENUES = ("BINANCE_USDM", "BYBIT_LINEAR")
@@ -1359,7 +1359,7 @@ def make_claim(
 def run_log_bytes(claim: dict[str, Any]) -> bytes:
     value = claim["value"]
     return (
-        "PIT_LEDGER_PUBLIC_ONLY_V1\n"
+        "PIT_LEDGER_PUBLIC_ONLY_V2\n"
         f"idempotency_key={value['idempotency_key']}\n"
         f"attempt_id={value['attempt_id']}\n"
         f"workflow_run_id={value['workflow_run_id']}\n"
@@ -1837,7 +1837,7 @@ class GitContext:
 class GitWriter:
     """Exact-parent, no-force writer for the isolated PIT branch."""
 
-    def __init__(self, repo: os.PathLike[str] | str, writer: str, branch: str = "pit-ledger-public-v1"):
+    def __init__(self, repo: os.PathLike[str] | str, writer: str, branch: str = "pit-ledger-public-v2"):
         self.repo, self.writer, self.branch = os.fspath(repo), writer, branch
 
     def git(self, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -2460,14 +2460,14 @@ def e2e_self_check() -> None:
         run(seed, "config", "user.name", "seed")
         run(seed, "config", "user.email", "seed@example.invalid")
         run(seed, "commit", "--allow-empty", "--quiet", "-m", "H0")
-        run(seed, "branch", "-M", "pit-ledger-public-v1")
+        run(seed, "branch", "-M", "pit-ledger-public-v2")
         run(seed, "remote", "add", "origin", remote)
-        run(seed, "push", "--quiet", "-u", "origin", "pit-ledger-public-v1")
+        run(seed, "push", "--quiet", "-u", "origin", "pit-ledger-public-v2")
         h0 = run(seed, "rev-parse", "HEAD")
         clones = []
         for name in ("a", "b", "wrong"):
             path = os.path.join(temp, name)
-            run(temp, "clone", "--quiet", "--branch", "pit-ledger-public-v1", remote, path)
+            run(temp, "clone", "--quiet", "--branch", "pit-ledger-public-v2", remote, path)
             run(path, "config", "user.name", "Actual Writer" if name == "wrong" else "PIT Ledger Writer")
             run(path, "config", "user.email", "actual@example.invalid" if name == "wrong" else "pit@example.invalid")
             clones.append(path)

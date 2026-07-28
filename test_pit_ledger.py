@@ -757,9 +757,9 @@ class PermissionAndStaticTests(unittest.TestCase):
             git(repo, "config", "user.name", "seed")
             git(repo, "config", "user.email", "seed@example.invalid")
             git(repo, "commit", "--allow-empty", "--quiet", "-m", "H0")
-            git(repo, "branch", "-M", "pit-ledger-public-v1")
+            git(repo, "branch", "-M", "pit-ledger-public-v2")
             git(repo, "remote", "add", "origin", str(remote))
-            git(repo, "push", "--quiet", "-u", "origin", "pit-ledger-public-v1")
+            git(repo, "push", "--quiet", "-u", "origin", "pit-ledger-public-v2")
             h0 = git(repo, "rev-parse", "HEAD")
             git(repo, "config", "user.name", "PIT Ledger Writer")
             git(repo, "config", "user.email", "pit@example.invalid")
@@ -999,12 +999,53 @@ class PermissionAndStaticTests(unittest.TestCase):
             )
         self.assertEqual(writer.recovered, [("2026-07-26T19:30:00.000Z", "A" * 64)])
 
+    def test_v2_bootstrap_matrix_and_normalized_parent_equivalence(self):
+        root = Path(__file__).parent
+        parent = "047f3a4a265021e3879b784bbe05abdb804213ea"
+        replacements = (
+            (b"PIT_LEDGER_PUBLIC_ONLY_V1", b"PIT_LEDGER_PUBLIC_ONLY_V2"),
+            (b"BASKET_PIT_LEDGER_TOP250_BINANCE_BYBIT_PUBLIC_V1", b"BASKET_PIT_LEDGER_TOP250_BINANCE_BYBIT_PUBLIC_V2"),
+            (b"pit-ledger-public-v1", b"pit-ledger-public-v2"),
+        )
+
+        def normalized_parent(path):
+            data = subprocess.run(
+                ["git", "show", f"{parent}:{path}"], cwd=root, capture_output=True, check=True
+            ).stdout
+            for old, new in replacements:
+                data = data.replace(old, new)
+            return data
+
+        self.assertEqual((root / "pit_ledger.py").read_bytes(), normalized_parent("pit_ledger.py"))
+        self.assertEqual((root / "README.md").read_bytes(), normalized_parent("README.md"))
+        expected_workflow = normalized_parent(".github/workflows/pit-ledger.yml").decode()
+        expected_workflow = expected_workflow.replace(
+            "on:\n  schedule:", "on:\n  workflow_dispatch:\n  schedule:", 1
+        ).replace(
+            "  capture:\n    runs-on:",
+            "  capture:\n"
+            "    if: >-\n"
+            "      (github.event_name == 'workflow_dispatch' && vars.PIT_BOOTSTRAP_MODE == 'MANUAL_S0') ||\n"
+            "      (github.event_name == 'schedule' && vars.PIT_BOOTSTRAP_MODE == 'SCHEDULED')\n"
+            "    runs-on:",
+            1,
+        )
+        workflow = (root / ".github/workflows/pit-ledger.yml").read_text()
+        self.assertEqual(workflow, expected_workflow)
+        allowed = {("workflow_dispatch", "MANUAL_S0"), ("schedule", "SCHEDULED")}
+        for event in ("workflow_dispatch", "schedule", "push", "UNKNOWN"):
+            for mode in ("MANUAL_S0", "SCHEDULED", "UNKNOWN", ""):
+                should_run = (
+                    event == "workflow_dispatch" and mode == "MANUAL_S0"
+                ) or (event == "schedule" and mode == "SCHEDULED")
+                self.assertEqual(should_run, (event, mode) in allowed)
+
     def test_schedule_and_branch_writer_are_frozen(self):
         workflow = (Path(__file__).parent / ".github/workflows/pit-ledger.yml").read_text()
         self.assertIn('cron: "2,32 * * * *"', workflow)
-        self.assertIn("ref: pit-ledger-public-v1", workflow)
+        self.assertIn("ref: pit-ledger-public-v2", workflow)
         self.assertIn("contents: write", workflow)
-        self.assertIn("HEAD:refs/heads/pit-ledger-public-v1", workflow)
+        self.assertIn("HEAD:refs/heads/pit-ledger-public-v2", workflow)
         self.assertNotIn("secrets.", workflow)
         p.acquisition_window("2026-07-26T20:00:00.000Z", datetime(2026, 7, 26, 20, 2, tzinfo=timezone.utc))
         p.acquisition_window("2026-07-26T20:30:00.000Z", datetime(2026, 7, 26, 20, 32, tzinfo=timezone.utc))
