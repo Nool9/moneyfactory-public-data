@@ -1,6 +1,7 @@
 name: PIT ledger public-only v1
 
 on:
+  workflow_dispatch:
   schedule:
     - cron: "2,32 * * * *"
 
@@ -8,17 +9,20 @@ permissions:
   contents: write
 
 concurrency:
-  group: pit-ledger-BASKET_PIT_LEDGER_TOP250_BINANCE_BYBIT_PUBLIC_V1
+  group: pit-ledger-BASKET_PIT_LEDGER_TOP250_BINANCE_BYBIT_PUBLIC_V2
   cancel-in-progress: false
 
 jobs:
   capture:
+    if: >-
+      (github.event_name == 'workflow_dispatch' && vars.PIT_BOOTSTRAP_MODE == 'MANUAL_S0') ||
+      (github.event_name == 'schedule' && vars.PIT_BOOTSTRAP_MODE == 'SCHEDULED')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: pit-ledger-public-v1
+          ref: pit-ledger-public-v2
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -33,5 +37,5 @@ jobs:
         run: |
           git config user.name "PIT Ledger Writer"
           git config user.email "pit-ledger@users.noreply.github.com"
-          # Runtime pushes only HEAD:refs/heads/pit-ledger-public-v1, never force.
+          # Runtime pushes only HEAD:refs/heads/pit-ledger-public-v2, never force.
           python pit_ledger.py workflow
