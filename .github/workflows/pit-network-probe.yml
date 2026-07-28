@@ -1,0 +1,178 @@
+name: PIT network probe v1
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Probe egress and PIT endpoints
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import http.client
+          import json
+          import queue
+          import socket
+          import ssl
+          import sys
+          import threading
+          import time
+          import urllib.parse
+          from pathlib import Path
+
+          TIMEOUT_SECONDS = 5
+          TARGETS = (
+              "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=250&page=1&sparkline=false",
+              "https://fapi.binance.com/fapi/v1/exchangeInfo",
+              "https://fapi.binance.com/fapi/v1/premiumIndex",
+              "https://fapi.binance.com/fapi/v1/ticker/bookTicker",
+              "https://api.bybit.com/v5/market/instruments-info?category=linear&limit=1000",
+              "https://api.bybit.com/v5/market/tickers?category=linear",
+              "https://api.bybit.com/v5/market/instruments-info?category=spot",
+              "https://api.bybit.com/v5/spot-margin-trade/data?vipLevel=No%20VIP",
+          )
+          EGRESS_URL = "https://api.ipify.org?format=json"
+          USER_AGENT = f"Python-urllib/{sys.version_info.major}.{sys.version_info.minor}"
+          HEADER_ALLOWLIST = {
+              "content-type", "content-length", "date", "server", "via", "x-request-id",
+              "cf-ray", "retry-after",
+          }
+
+          def elapsed_ms(start):
+              return round((time.monotonic() - start) * 1000, 3)
+
+          def bounded(call):
+              result = queue.Queue(maxsize=1)
+
+              def run():
+                  try:
+                      result.put((True, call()))
+                  except BaseException as error:
+                      result.put((False, error))
+
+              threading.Thread(target=run, daemon=True).start()
+              try:
+                  ok, value = result.get(timeout=TIMEOUT_SECONDS)
+              except queue.Empty:
+                  raise TimeoutError(f"DNS timed out after {TIMEOUT_SECONDS}s")
+              if ok:
+                  return value
+              raise value
+
+          def error_fields(row, error):
+              row["exception_class"] = type(error).__name__
+              row["errno"] = getattr(error, "errno", None)
+              row["exception_text"] = str(error)
+
+          def probe(url, keep_body=False):
+              row = {
+                  "url": url,
+                  "dns_addresses": [], "dns_elapsed_ms": None,
+                  "tcp_ok": False, "tcp_elapsed_ms": None,
+                  "tls_ok": False, "tls_elapsed_ms": None, "tls_version": None,
+                  "http_status": None, "http_elapsed_ms": None,
+                  "response_bytes": None, "response_sha256": None, "selected_headers": {},
+                  "exception_class": None, "errno": None, "exception_text": None,
+              }
+              body = b""
+              try:
+                  parsed = urllib.parse.urlsplit(url)
+                  if parsed.scheme != "https" or not parsed.hostname:
+                      raise ValueError("only absolute HTTPS URLs are allowed")
+                  port = parsed.port or 443
+                  start = time.monotonic()
+                  addresses = bounded(lambda: socket.getaddrinfo(
+                      parsed.hostname, port, type=socket.SOCK_STREAM
+                  ))
+                  row["dns_elapsed_ms"] = elapsed_ms(start)
+                  seen = set()
+                  for family, _, _, _, address in addresses:
+                      item = address[0]
+                      if item not in seen:
+                          seen.add(item)
+                          row["dns_addresses"].append(item)
+                  if not addresses:
+                      raise OSError("DNS returned no addresses")
+                  family, socktype, proto, _, address = addresses[0]
+                  start = time.monotonic()
+                  raw = socket.socket(family, socktype, proto)
+                  raw.settimeout(TIMEOUT_SECONDS)
+                  try:
+                      raw.connect(address)
+                      row["tcp_ok"] = True
+                      row["tcp_elapsed_ms"] = elapsed_ms(start)
+                      start = time.monotonic()
+                      tls = ssl.create_default_context().wrap_socket(raw, server_hostname=parsed.hostname)
+                      row["tls_ok"] = True
+                      row["tls_elapsed_ms"] = elapsed_ms(start)
+                      row["tls_version"] = tls.version()
+                      try:
+                          path = (parsed.path or "/") + (f"?{parsed.query}" if parsed.query else "")
+                          host = parsed.hostname + (f":{port}" if parsed.port else "")
+                          request = (
+                              f"GET {path} HTTP/1.1\\r\\nHost: {host}\\r\\n"
+                              f"User-Agent: {USER_AGENT}\\r\\nConnection: close\\r\\n\\r\\n"
+                          ).encode("ascii")
+                          start = time.monotonic()
+                          tls.sendall(request)
+                          response = http.client.HTTPResponse(tls)
+                          response.begin()
+                          row["http_status"] = response.status
+                          row["selected_headers"] = {
+                              name.lower(): value for name, value in response.getheaders()
+                              if name.lower() in HEADER_ALLOWLIST
+                          }
+                          digest = hashlib.sha256()
+                          parts = [] if keep_body else None
+                          size = 0
+                          while chunk := response.read(65536):
+                              size += len(chunk)
+                              digest.update(chunk)
+                              if parts is not None:
+                                  parts.append(chunk)
+                          row["http_elapsed_ms"] = elapsed_ms(start)
+                          row["response_bytes"] = size
+                          row["response_sha256"] = digest.hexdigest()
+                          if parts is not None:
+                              body = b"".join(parts)
+                      finally:
+                          tls.close()
+                  except BaseException:
+                      raw.close()
+                      raise
+              except BaseException as error:
+                  error_fields(row, error)
+              return row, body
+
+          egress, egress_body = probe(EGRESS_URL, keep_body=True)
+          try:
+              egress["ip"] = json.loads(egress_body.decode("utf-8"))["ip"]
+          except BaseException as error:
+              egress["ip"] = None
+              if egress["exception_class"] is None:
+                  error_fields(egress, error)
+          del egress_body
+          output = {
+              "schema": "moneyfactory.pit_network_probe.v1",
+              "method": "GET",
+              "user_agent": USER_AGENT,
+              "egress": egress,
+              "targets": [probe(url)[0] for url in TARGETS],
+          }
+          rendered = json.dumps(output, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+          Path("pit-network-probe.json").write_text(rendered, encoding="utf-8")
+          print(rendered, end="")
+          PY
+      - name: Upload probe result
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: pit-network-probe-v1
+          path: pit-network-probe.json
+          retention-days: 7
