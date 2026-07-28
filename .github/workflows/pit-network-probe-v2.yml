@@ -1,0 +1,291 @@
+name: PIT network probe v2
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Probe egress and PIT endpoints
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import http.client
+          import ipaddress
+          import json
+          import os
+          import queue
+          import socket
+          import ssl
+          import sys
+          import threading
+          import time
+          from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+          from pathlib import Path
+          from urllib.parse import urlsplit
+
+          TIMEOUT_SECONDS = 5
+          MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+          TARGETS = (
+              "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=250&page=1&sparkline=false",
+              "https://fapi.binance.com/fapi/v1/exchangeInfo",
+              "https://fapi.binance.com/fapi/v1/premiumIndex",
+              "https://fapi.binance.com/fapi/v1/ticker/bookTicker",
+              "https://api.bybit.com/v5/market/instruments-info?category=linear&limit=1000",
+              "https://api.bybit.com/v5/market/tickers?category=linear",
+              "https://api.bybit.com/v5/market/instruments-info?category=spot",
+              "https://api.bybit.com/v5/spot-margin-trade/data?vipLevel=No%20VIP",
+          )
+          EGRESS_URL = "https://api.ipify.org?format=json"
+          USER_AGENT = f"Python-urllib/{sys.version_info.major}.{sys.version_info.minor}"
+          HEADER_ALLOWLIST = {
+              "content-type", "content-length", "date", "server", "via", "x-request-id",
+              "cf-ray", "retry-after",
+          }
+
+          def elapsed_ms(start):
+              return round((time.monotonic() - start) * 1000, 3)
+
+          def error_fields(row, error):
+              errno = getattr(error, "errno", None)
+              row["exception_class"] = type(error).__name__
+              row["errno"] = errno if isinstance(errno, int) else None
+              row["exception_text"] = str(error)
+
+          def bounded(call):
+              result = queue.Queue(maxsize=1)
+
+              def run():
+                  try:
+                      result.put((True, call()))
+                  except BaseException as error:
+                      result.put((False, error))
+
+              threading.Thread(target=run, daemon=True).start()
+              try:
+                  ok, value = result.get(timeout=TIMEOUT_SECONDS)
+              except queue.Empty:
+                  raise TimeoutError(f"operation timed out after {TIMEOUT_SECONDS}s")
+              if ok:
+                  return value
+              raise value
+
+          def http_fetch(url, keep_body=False):
+              result = {
+                  "http_status": None,
+                  "http_elapsed_ms": None,
+                  "selected_headers": {},
+                  "response_bytes": None,
+                  "response_sha256": None,
+                  "body": b"",
+                  "error": None,
+              }
+              connection = None
+              start = time.monotonic()
+              deadline = start + TIMEOUT_SECONDS
+
+              def set_remaining_timeout():
+                  remaining = deadline - time.monotonic()
+                  if remaining <= 0:
+                      raise TimeoutError(f"HTTP fetch timed out after {TIMEOUT_SECONDS}s")
+                  if connection.sock is not None:
+                      connection.sock.settimeout(remaining)
+                  return remaining
+
+              try:
+                  parsed = urlsplit(url)
+                  if not parsed.hostname or parsed.scheme not in {"http", "https"}:
+                      raise ValueError("absolute HTTP(S) URL required")
+                  port = parsed.port or (443 if parsed.scheme == "https" else 80)
+                  path = (parsed.path or "/") + (f"?{parsed.query}" if parsed.query else "")
+                  if parsed.scheme == "https":
+                      connection = http.client.HTTPSConnection(parsed.hostname, port, timeout=TIMEOUT_SECONDS)
+                  else:
+                      connection = http.client.HTTPConnection(parsed.hostname, port, timeout=TIMEOUT_SECONDS)
+                  connection.request("GET", path, headers={"User-Agent": USER_AGENT})
+                  set_remaining_timeout()
+                  response = connection.getresponse()
+                  if not isinstance(response.status, int) or not 100 <= response.status <= 599:
+                      raise ValueError("HTTP response status must be an integer from 100 through 599")
+                  result["http_status"] = response.status
+                  result["selected_headers"] = {
+                      name.lower(): value for name, value in response.getheaders()
+                      if name.lower() in HEADER_ALLOWLIST
+                  }
+                  digest = hashlib.sha256()
+                  size = 0
+                  chunks = [] if keep_body else None
+                  while True:
+                      set_remaining_timeout()
+                      chunk = response.read1(min(65536, MAX_RESPONSE_BYTES - size + 1))
+                      if time.monotonic() > deadline:
+                          raise TimeoutError(f"HTTP fetch timed out after {TIMEOUT_SECONDS}s")
+                      if not chunk:
+                          break
+                      size += len(chunk)
+                      if size > MAX_RESPONSE_BYTES:
+                          raise ValueError(f"HTTP response exceeds {MAX_RESPONSE_BYTES} bytes")
+                      digest.update(chunk)
+                      if chunks is not None:
+                          chunks.append(chunk)
+                  result["http_elapsed_ms"] = elapsed_ms(start)
+                  result["response_bytes"] = size
+                  result["response_sha256"] = digest.hexdigest()
+                  if chunks is not None:
+                      result["body"] = b"".join(chunks)
+              except BaseException as error:
+                  result["http_elapsed_ms"] = elapsed_ms(start)
+                  result["error"] = error
+              finally:
+                  if connection is not None:
+                      connection.close()
+              return result
+
+          def target_record(url):
+              row = {
+                  "url": url,
+                  "phase": "not_started",
+                  "dns_addresses": [],
+                  "dns_elapsed_ms": None,
+                  "tcp_ok": False,
+                  "tcp_elapsed_ms": None,
+                  "tls_ok": False,
+                  "tls_elapsed_ms": None,
+                  "tls_version": None,
+                  "http_status": None,
+                  "http_elapsed_ms": None,
+                  "response_bytes": None,
+                  "response_sha256": None,
+                  "selected_headers": {},
+                  "exception_class": None,
+                  "errno": None,
+                  "exception_text": None,
+              }
+              try:
+                  parsed = urlsplit(url)
+                  host = parsed.hostname
+                  port = parsed.port or 443
+                  if parsed.scheme != "https" or not host:
+                      raise ValueError("absolute HTTPS URL required")
+                  row["phase"] = "dns"
+                  start = time.monotonic()
+                  addresses = bounded(lambda: socket.getaddrinfo(host, port, type=socket.SOCK_STREAM))
+                  row["dns_elapsed_ms"] = elapsed_ms(start)
+                  seen = set()
+                  for _, _, _, _, address in addresses:
+                      if address[0] not in seen:
+                          seen.add(address[0])
+                          row["dns_addresses"].append(address[0])
+                  if not addresses:
+                      raise OSError("DNS returned no addresses")
+                  family, socktype, proto, _, address = addresses[0]
+                  row["phase"] = "tcp"
+                  start = time.monotonic()
+                  with socket.socket(family, socktype, proto) as raw:
+                      raw.settimeout(TIMEOUT_SECONDS)
+                      raw.connect(address)
+                      row["tcp_ok"] = True
+                      row["tcp_elapsed_ms"] = elapsed_ms(start)
+                  row["phase"] = "tls"
+                  start = time.monotonic()
+                  with socket.socket(family, socktype, proto) as raw:
+                      raw.settimeout(TIMEOUT_SECONDS)
+                      raw.connect(address)
+                      with ssl.create_default_context().wrap_socket(raw, server_hostname=host) as tls:
+                          row["tls_ok"] = True
+                          row["tls_elapsed_ms"] = elapsed_ms(start)
+                          row["tls_version"] = tls.version()
+                  row["phase"] = "http"
+                  fetched = http_fetch(url)
+                  for key in ("http_status", "http_elapsed_ms", "response_bytes", "response_sha256", "selected_headers"):
+                      row[key] = fetched[key]
+                  if fetched["error"] is not None:
+                      error_fields(row, fetched["error"])
+                  else:
+                      row["phase"] = "complete"
+              except BaseException as error:
+                  error_fields(row, error)
+              return row
+
+          class OracleHandler(BaseHTTPRequestHandler):
+              valid = False
+
+              def do_GET(self):
+                  type(self).valid = self.path == "/oracle" and self.headers.get("User-Agent") == USER_AGENT
+                  self.send_response(204 if type(self).valid else 400)
+                  self.end_headers()
+
+              def log_message(self, format, *args):
+                  pass
+
+          def write_output(output):
+              rendered = json.dumps(output, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+              Path("pit-network-probe-v2.json").write_text(rendered, encoding="utf-8")
+              print(rendered, end="")
+
+          oracle_server = ThreadingHTTPServer(("127.0.0.1", 0), OracleHandler)
+          oracle_thread = threading.Thread(target=oracle_server.serve_forever, daemon=True)
+          oracle_thread.start()
+          try:
+              oracle_fetch = http_fetch(f"http://127.0.0.1:{oracle_server.server_port}/oracle")
+          finally:
+              oracle_server.shutdown()
+              oracle_thread.join()
+              oracle_server.server_close()
+          oracle_pass = (
+              OracleHandler.valid
+              and oracle_fetch["http_status"] == 204
+              and oracle_fetch["error"] is None
+          )
+          oracle = {
+              "pass": oracle_pass,
+              "http_status": oracle_fetch["http_status"],
+              "exception_class": None if oracle_fetch["error"] is None else type(oracle_fetch["error"]).__name__,
+          }
+          base = {
+              "schema": "moneyfactory.pit_network_probe.v2",
+              "method": "GET",
+              "user_agent": USER_AGENT,
+              "oracle": oracle,
+          }
+          if not oracle_pass:
+              write_output({**base, "egress": None, "targets": [], "terminal": "INVALID_ORACLE_AWAITING_BOARD"})
+              raise SystemExit(1)
+
+          if os.environ.get("PIT_NETWORK_PROBE_LOCAL_ONLY") == "1":
+              write_output({**base, "egress": None, "targets": [], "terminal": "RESULT_RECORDED_AWAITING_BOARD"})
+              raise SystemExit(0)
+
+          egress_fetch = http_fetch(EGRESS_URL, keep_body=True)
+          egress = {key: egress_fetch[key] for key in (
+              "http_status", "http_elapsed_ms", "response_bytes", "response_sha256", "selected_headers",
+          )}
+          egress["url"] = EGRESS_URL
+          egress["ip"] = None
+          egress["exception_class"] = None
+          if egress_fetch["error"] is not None:
+              egress["exception_class"] = type(egress_fetch["error"]).__name__
+          else:
+              try:
+                  egress["ip"] = str(ipaddress.ip_address(json.loads(egress_fetch["body"].decode("utf-8"))["ip"]))
+              except BaseException as error:
+                  egress["exception_class"] = type(error).__name__
+          write_output({
+              **base,
+              "egress": egress,
+              "targets": [target_record(url) for url in TARGETS],
+              "terminal": "RESULT_RECORDED_AWAITING_BOARD",
+          })
+          PY
+      - name: Upload probe result
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: pit-network-probe-v2
+          path: pit-network-probe-v2.json
+          retention-days: 7
