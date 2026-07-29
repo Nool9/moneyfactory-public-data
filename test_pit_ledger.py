@@ -46,7 +46,7 @@ def bybit_instrument(base="BTC"):
     }
 
 
-def complete_snapshot_fixture(bybit_page_count=1, binance_case=None, failed_source=None, parent="H0", writer="writer"):
+def complete_snapshot_fixture(bybit_page_count=1, binance_case=None, failed_source=None, parent="H0", writer="writer", bybit_borrowable_body=None):
     slot = "2026-07-26T20:00:00.000Z"
     ledger = p.Ledger(writer, head=parent)
     claim = p.make_claim(slot, "A" * 64, writer, ledger.head)
@@ -56,8 +56,10 @@ def complete_snapshot_fixture(bybit_page_count=1, binance_case=None, failed_sour
         "BN_FUT_PREMIUM_INDEX": b"[]", "BN_FUT_BOOK_TICKER": b"[]",
         "BY_LINEAR_TICKERS": b'{"result":{"list":[]},"time":1720000000123}',
         "BY_SPOT_INSTRUMENTS": b'{"result":{"list":[]}}',
-        "BY_MARGIN_BORROWABLE": b'{"result":{"list":[]}}',
+        "BY_MARGIN_BORROWABLE": b'{"result":{"vipCoinList":[{"vipLevel":"No VIP","list":[]}]}}',
     }
+    if bybit_borrowable_body is not None:
+        bodies["BY_MARGIN_BORROWABLE"] = bybit_borrowable_body
     if binance_case in {"missing_ticker", "public_perp"}:
         bodies["BN_FUT_EXCHANGE_INFO"] = json.dumps(
             {"symbols": [binance_instrument("X0")]}, separators=(",", ":")
@@ -294,13 +296,55 @@ class UniverseAndMappingTests(unittest.TestCase):
             with self.assertRaises(p.PitError):
                 p.validate_snapshot(broken)
 
-    def test_bybit_uta_four_margin_enums_and_unknown(self):
+    def test_bybit_borrow_envelope_and_r4_truth_table(self):
+        body = {
+            "result": {"vipCoinList": [{"vipLevel": "No VIP", "list": [
+                {"currency": "BTC", "borrowable": True},
+            ]}]},
+        }
+        p.validate_source_schema("BY_MARGIN_BORROWABLE", body)
+        self.assertEqual(p._bybit_borrowable_rows(body), body["result"]["vipCoinList"][0]["list"])
+        claim, manifests, snapshot, context = complete_snapshot_fixture(
+            bybit_borrowable_body=json.dumps(body, separators=(",", ":")).encode()
+        )
+        p.validate_snapshot(snapshot, claim, manifests, context, False, "A" * 64)
+        for invalid in (
+            {"result": {"vipCoinList": []}},
+            {"result": {"vipCoinList": [{"vipLevel": "No VIP", "list": []}, {"vipLevel": "No VIP", "list": []}]}},
+            {"result": {"vipCoinList": [{"vipLevel": "VIP 1", "list": []}]}},
+            {"result": {"vipCoinList": [{"vipLevel": "No VIP", "list": [{"currency": "BTC", "borrowable": 1}]}]}},
+        ):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(p.PitError):
+                    p.validate_source_schema("BY_MARGIN_BORROWABLE", invalid)
+        _, manifests, snapshot, _ = complete_snapshot_fixture(bybit_borrowable_body=b"{")
+        borrow_manifest = next(item for item in manifests if item["source_id"] == "BY_MARGIN_BORROWABLE")
+        self.assertEqual((borrow_manifest["source_status"], borrow_manifest["parse_status"], snapshot["reason_codes"]), ("SOURCE_OK", "PARSE_FAILURE", ["PARSE_FAILURE"]))
+
         currencies = [{"currency": "BTC", "borrowable": True}]
         expected = {"none": False, "normalSpotOnly": False, "utaOnly": True, "both": True}
         for enum, result in expected.items():
             spots = [{"baseCoin": "BTC", "quoteCoin": "USDT", "marginTrading": enum}]
             self.assertIs(p.borrowable_bybit("BTC", currencies, spots), result)
+        self.assertIs(p.borrowable_bybit("BTC", [], [{"baseCoin": "BTC", "quoteCoin": "USDT", "marginTrading": "both"}]), False)
+        self.assertIs(p.borrowable_bybit("BTC", currencies, []), False)
+        self.assertIsNone(p.borrowable_bybit("BTC", currencies * 2, [{"baseCoin": "BTC", "quoteCoin": "USDT", "marginTrading": "both"}]))
+        self.assertIsNone(p.borrowable_bybit("BTC", currencies, [{"baseCoin": "BTC", "quoteCoin": "USDT", "marginTrading": "both"}] * 2))
         self.assertIsNone(p.borrowable_bybit("BTC", currencies, [{"baseCoin": "BTC", "quoteCoin": "USDT", "marginTrading": "future"}]))
+
+    def test_binance_inactive_book_ticker_is_source_only(self):
+        valid = [
+            {"symbol": "BTCUSDT", "bidPrice": "99", "askPrice": "100"},
+            {"symbol": "BTCUSDT_260626", "bidPrice": "0.0", "askPrice": "0.0"},
+        ]
+        p.validate_source_schema("BN_FUT_BOOK_TICKER", valid)
+        for bid, ask in (("0", "1"), ("1", "0"), ("-1", "1"), ("2", "1")):
+            with self.subTest(bid=bid, ask=ask):
+                with self.assertRaises(p.PitError):
+                    p.validate_source_schema("BN_FUT_BOOK_TICKER", [{"symbol": "BTCUSDT", "bidPrice": bid, "askPrice": ask}])
+        premium = [{"symbol": "BTCUSDT", "lastFundingRate": "0.001", "markPrice": "100", "indexPrice": "100", "time": 1720000000123}]
+        with self.assertRaises(p.PitError):
+            p._ticker_record("BINANCE_USDM", "BTCUSDT", premium, [{"symbol": "BTCUSDT", "bidPrice": "0", "askPrice": "0"}], None)
 
     def test_full_250_asset_500_venue_snapshot_and_validator(self):
         writer, slot = "writer", "2026-07-26T20:00:00.000Z"
@@ -315,7 +359,7 @@ class UniverseAndMappingTests(unittest.TestCase):
             "BN_FUT_BOOK_TICKER": b"[]",
             "BY_LINEAR_TICKERS": b'{"result":{"list":[]},"time":1720000000123}',
             "BY_SPOT_INSTRUMENTS": b'{"result":{"list":[]}}',
-            "BY_MARGIN_BORROWABLE": b'{"result":{"list":[]}}',
+            "BY_MARGIN_BORROWABLE": b'{"result":{"vipCoinList":[{"vipLevel":"No VIP","list":[]}]}}',
         }
         pages = [b'{"result":{"list":[],"nextPageCursor":"next"}}', b'{"result":{"list":[],"nextPageCursor":""}}']
         def fetch(source, url):
@@ -818,6 +862,9 @@ class PermissionAndStaticTests(unittest.TestCase):
                 )
                 self.assertEqual(len(snapshot["assets"]), 250)
                 self.assertEqual(snapshot["qa"], {"qa_status": "QA_FAILURE", "reason_codes": ["SOURCE_FAILURE"]})
+                if source_id == "BY_MARGIN_BORROWABLE":
+                    manifest = next(item for item in manifests if item["source_id"] == source_id)
+                    self.assertEqual((manifest["source_status"], manifest["parse_status"]), ("SOURCE_FAILURE", "PARSE_NOT_RUN"))
                 self.assertEqual(
                     (
                         snapshot["attempt_started_at_utc"],
@@ -1092,13 +1139,13 @@ class PermissionAndStaticTests(unittest.TestCase):
             )
         self.assertEqual(writer.recovered, [("2026-07-26T19:30:00.000Z", "A" * 64)])
 
-    def test_v5_container_and_branch_are_frozen(self):
+    def test_v6_container_and_branch_are_frozen(self):
         root = Path(__file__).parent
         docker = (root / "Dockerfile").read_text()
         self.assertFalse((root / ".github/workflows/pit-ledger.yml").exists())
-        self.assertEqual(p.CONTRACT_ID, "PIT_LEDGER_PUBLIC_ONLY_V5")
-        self.assertEqual(p.EPOCH_ID, "BASKET_PIT_LEDGER_TOP250_BINANCE_BYBIT_PUBLIC_V5")
-        self.assertEqual(p.GITHUB_BRANCH, "pit-ledger-public-v5")
+        self.assertEqual(p.CONTRACT_ID, "PIT_LEDGER_PUBLIC_ONLY_V6")
+        self.assertEqual(p.EPOCH_ID, "BASKET_PIT_LEDGER_TOP250_BINANCE_BYBIT_PUBLIC_V6")
+        self.assertEqual(p.GITHUB_BRANCH, "pit-ledger-public-v6")
         self.assertIn("FROM --platform=linux/amd64 python:3.12-slim-bookworm@sha256:8a7e7cc04fd3e2bd787f7f24e22d5d119aa590d429b50c95dfe12b3abe52f48b", docker)
         self.assertIn("COPY Dockerfile pit_ledger.py /app/", docker)
         self.assertIn('ENTRYPOINT ["python","/app/pit_ledger.py","cloud-run"]', docker)

@@ -24,12 +24,12 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Callable, Iterable
 
-CONTRACT_ID = "PIT_LEDGER_PUBLIC_ONLY_V5"
-EPOCH_ID = "BASKET_PIT_LEDGER_TOP250_BINANCE_BYBIT_PUBLIC_V5"
+CONTRACT_ID = "PIT_LEDGER_PUBLIC_ONLY_V6"
+EPOCH_ID = "BASKET_PIT_LEDGER_TOP250_BINANCE_BYBIT_PUBLIC_V6"
 PREFIX = f"pit_ledger/{EPOCH_ID}/"
 CONCURRENCY_GROUP = f"pit-ledger-{EPOCH_ID}"
 GITHUB_REPO = "git@github.com:Nool9/moneyfactory-public-data.git"
-GITHUB_BRANCH = "pit-ledger-public-v5"
+GITHUB_BRANCH = "pit-ledger-public-v6"
 AUTHORIZED_WRITER = "PIT Ledger Writer <pit-ledger@users.noreply.github.com>"
 SECRET_MOUNT = "/secrets/github/id_ed25519"
 KNOWN_HOSTS = "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl\n"
@@ -547,6 +547,13 @@ def _rows(value: Any, *path: str) -> list[dict[str, Any]]:
     return value
 
 
+def _bybit_borrowable_rows(body: Any) -> list[dict[str, Any]]:
+    envelopes = _rows(body, "result", "vipCoinList")
+    if len(envelopes) != 1 or envelopes[0].get("vipLevel") != "No VIP":
+        raise PitError("SCHEMA_FAILURE")
+    return _rows(envelopes[0], "list")
+
+
 def _ticker_record(
     venue: str,
     candidate: str,
@@ -621,7 +628,7 @@ def build_snapshot(
         if source_id in source_errors:
             return None
         try:
-            return _rows(sources[source_id], *path)
+            return _bybit_borrowable_rows(sources[source_id]) if source_id == "BY_MARGIN_BORROWABLE" else _rows(sources[source_id], *path)
         except (KeyError, TypeError, PitError):
             source_errors[source_id] = "SCHEMA_FAILURE"
             primary_error = primary_error or "SCHEMA_FAILURE"
@@ -631,7 +638,7 @@ def build_snapshot(
     bn_premium = source_rows("BN_FUT_PREMIUM_INDEX")
     bn_books = source_rows("BN_FUT_BOOK_TICKER")
     by_spots = source_rows("BY_SPOT_INSTRUMENTS", "result", "list")
-    by_currencies = source_rows("BY_MARGIN_BORROWABLE", "result", "list")
+    by_currencies = source_rows("BY_MARGIN_BORROWABLE")
     by_instruments = None
     if "BY_LINEAR_INSTRUMENTS" not in source_errors:
         try:
@@ -1226,12 +1233,14 @@ def validate_source_schema(source_id: str, body: Any) -> None:
         rows = _rows(body, "symbols")
     elif source_id in {"BN_FUT_PREMIUM_INDEX", "BN_FUT_BOOK_TICKER"}:
         rows = _rows(body)
-    elif source_id in {"BY_LINEAR_INSTRUMENTS", "BY_SPOT_INSTRUMENTS", "BY_MARGIN_BORROWABLE"}:
+    elif source_id in {"BY_LINEAR_INSTRUMENTS", "BY_SPOT_INSTRUMENTS"}:
         rows = _rows(body, "result", "list")
         if source_id == "BY_LINEAR_INSTRUMENTS":
             cursor = body["result"].get("nextPageCursor", "")
             if not isinstance(cursor, str):
                 raise PitError("SCHEMA_FAILURE")
+    elif source_id == "BY_MARGIN_BORROWABLE":
+        rows = _bybit_borrowable_rows(body)
     elif source_id == "BY_LINEAR_TICKERS":
         rows = _rows(body, "result", "list")
         utc_from_ms(body.get("time"))
@@ -1261,9 +1270,9 @@ def validate_source_schema(source_id: str, body: Any) -> None:
             parse_decimal_string(row["indexPrice"], positive=True)
     elif source_id == "BN_FUT_BOOK_TICKER":
         for row in rows:
-            bid = parse_decimal_string(row["bidPrice"], positive=True)
-            ask = parse_decimal_string(row["askPrice"], positive=True)
-            if bid > ask:
+            bid = parse_decimal_string(row["bidPrice"])
+            ask = parse_decimal_string(row["askPrice"])
+            if (bid != 0 or ask != 0) and (bid <= 0 or ask <= 0 or bid > ask):
                 raise PitError("SCHEMA_FAILURE")
     elif source_id == "BY_LINEAR_TICKERS":
         for row in rows:
@@ -1365,7 +1374,7 @@ def make_claim(
 def run_log_bytes(claim: dict[str, Any]) -> bytes:
     value = claim["value"]
     return (
-        "PIT_LEDGER_PUBLIC_ONLY_V5\n"
+        "PIT_LEDGER_PUBLIC_ONLY_V6\n"
         f"idempotency_key={value['idempotency_key']}\n"
         f"attempt_id={value['attempt_id']}\n"
         f"workflow_run_id={value['workflow_run_id']}\n"
