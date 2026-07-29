@@ -346,6 +346,16 @@ class UniverseAndMappingTests(unittest.TestCase):
         with self.assertRaises(p.PitError):
             p._ticker_record("BINANCE_USDM", "BTCUSDT", premium, [{"symbol": "BTCUSDT", "bidPrice": "0", "askPrice": "0"}], None)
 
+    def test_bybit_empty_funding_is_source_only(self):
+        row = {"symbol": "BTCUSDT", "fundingRate": "", "bid1Price": "99", "ask1Price": "100", "markPrice": "100", "indexPrice": "100"}
+        body = {"result": {"list": [row]}, "time": 1720000000123}
+        p.validate_source_schema("BY_LINEAR_TICKERS", body)
+        malformed = dict(row, fundingRate="not-a-decimal")
+        with self.assertRaises(p.PitError):
+            p.validate_source_schema("BY_LINEAR_TICKERS", {"result": {"list": [malformed]}, "time": 1720000000123})
+        with self.assertRaises(p.PitError):
+            p._ticker_record("BYBIT_LINEAR", "BTCUSDT", None, None, body)
+
     def test_full_250_asset_500_venue_snapshot_and_validator(self):
         writer, slot = "writer", "2026-07-26T20:00:00.000Z"
         ledger = p.Ledger(writer)
@@ -1139,13 +1149,13 @@ class PermissionAndStaticTests(unittest.TestCase):
             )
         self.assertEqual(writer.recovered, [("2026-07-26T19:30:00.000Z", "A" * 64)])
 
-    def test_v6_container_and_branch_are_frozen(self):
+    def test_v7_container_and_branch_are_frozen(self):
         root = Path(__file__).parent
         docker = (root / "Dockerfile").read_text()
         self.assertFalse((root / ".github/workflows/pit-ledger.yml").exists())
-        self.assertEqual(p.CONTRACT_ID, "PIT_LEDGER_PUBLIC_ONLY_V6")
-        self.assertEqual(p.EPOCH_ID, "BASKET_PIT_LEDGER_TOP250_BINANCE_BYBIT_PUBLIC_V6")
-        self.assertEqual(p.GITHUB_BRANCH, "pit-ledger-public-v6")
+        self.assertEqual(p.CONTRACT_ID, "PIT_LEDGER_PUBLIC_ONLY_V7")
+        self.assertEqual(p.EPOCH_ID, "BASKET_PIT_LEDGER_TOP250_BINANCE_BYBIT_PUBLIC_V7")
+        self.assertEqual(p.GITHUB_BRANCH, "pit-ledger-public-v7")
         self.assertIn("FROM --platform=linux/amd64 python:3.12-slim-bookworm@sha256:8a7e7cc04fd3e2bd787f7f24e22d5d119aa590d429b50c95dfe12b3abe52f48b", docker)
         self.assertIn("COPY Dockerfile pit_ledger.py /app/", docker)
         self.assertIn('ENTRYPOINT ["python","/app/pit_ledger.py","cloud-run"]', docker)
