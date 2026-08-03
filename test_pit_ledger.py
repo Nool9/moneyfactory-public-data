@@ -1,5 +1,6 @@
 import base64
 import hashlib
+import io
 import json
 import os
 import subprocess
@@ -655,6 +656,7 @@ class PermissionAndStaticTests(unittest.TestCase):
         calls = []
 
         secret = "PRIVATE_KEY_SHOULD_NOT_LEAK"
+        child_stderr = [secret]
 
         def offline_run(args, **kwargs):
             calls.append((args, kwargs))
@@ -668,12 +670,14 @@ class PermissionAndStaticTests(unittest.TestCase):
                 return subprocess.CompletedProcess(args, 0, p.GITHUB_BRANCH + "\n", "")
             if args[:3] == ["git", "remote", "get-url"]:
                 return subprocess.CompletedProcess(args, 0, p.GITHUB_REPO + "\n", "")
+            if args == ["git", "config", "--get", "remote.origin.partialclonefilter"]:
+                return subprocess.CompletedProcess(args, 0, "blob:none\n", "")
             if args[:3] == ["git", "config", "user.name"]:
                 return subprocess.CompletedProcess(args, 0, "PIT Ledger Writer\n" if len(args) == 3 else "", "")
             if args[:3] == ["git", "config", "user.email"]:
                 return subprocess.CompletedProcess(args, 0, "pit-ledger@users.noreply.github.com\n" if len(args) == 3 else "", "")
             if args[-1] == "capture":
-                return subprocess.CompletedProcess(args, 1, secret, secret)
+                return subprocess.CompletedProcess(args, 1, secret, child_stderr[0])
             raise AssertionError(args)
 
         with (
@@ -683,22 +687,33 @@ class PermissionAndStaticTests(unittest.TestCase):
         ):
             p.cloud_run()
         no_call.assert_not_called()
-        with tempfile.TemporaryDirectory() as temp:
-            key = Path(temp, "id_ed25519")
-            key.write_bytes(b"private fixture")
-            with (
-                patch.dict(os.environ, full, clear=True),
-                patch.object(p, "SECRET_MOUNT", str(key)),
-                patch.object(p, "current_i_impl", return_value=full["PIT_I_IMPL"]),
-                patch.object(p.subprocess, "run", side_effect=offline_run),
-                self.assertRaises(p.PitError) as raised,
-            ):
-                p.cloud_run()
-        self.assertEqual(str(raised.exception), "STOP_PERMISSION_REQUIRED_CAPTURE")
-        self.assertNotIn(secret, str(raised.exception))
+        for child_stderr[0], expected in (
+            (secret, "CAPTURE_CHILD_STDERR_SHA256="),
+            ("PIT_ERROR:SCHEMA_FAILURE", "SCHEMA_FAILURE"),
+        ):
+            with tempfile.TemporaryDirectory() as temp:
+                key = Path(temp, "id_ed25519")
+                key.write_bytes(b"private fixture")
+                with (
+                    patch.dict(os.environ, full, clear=True),
+                    patch.object(p, "SECRET_MOUNT", str(key)),
+                    patch.object(p, "current_i_impl", return_value=full["PIT_I_IMPL"]),
+                    patch.object(p.subprocess, "run", side_effect=offline_run),
+                    patch("sys.stderr", new_callable=io.StringIO) as stderr,
+                    self.assertRaises(p.PitError) as raised,
+                ):
+                    p.cloud_run()
+            self.assertEqual(str(raised.exception), "STOP_PERMISSION_REQUIRED_CAPTURE")
+            self.assertIn(expected, stderr.getvalue())
+            if child_stderr[0] == secret:
+                self.assertNotIn(secret, str(raised.exception))
+                self.assertNotIn(secret, stderr.getvalue())
         self.assertEqual(calls[-1][0][-1], "capture")
         self.assertTrue(calls[-1][1]["capture_output"])
         self.assertTrue(calls[-1][1]["text"])
+        clone = next(args for args, _ in calls if args[:2] == ["git", "clone"])
+        self.assertIn("--filter=blob:none", clone)
+        self.assertIn("--sparse", clone)
         with tempfile.TemporaryDirectory() as temp:
             private = Path(temp, "id_ed25519")
             generated = subprocess.run(
@@ -725,6 +740,67 @@ class PermissionAndStaticTests(unittest.TestCase):
         for item in value["files"]:
             raw = (root / item["path"]).read_bytes()
             self.assertEqual((item["bytes"], item["sha256"]), (len(raw), p.sha256(raw)))
+
+    def test_live_capture_batches_eight_raw_pages_into_11_commits(self):
+        class CountingWriter:
+            def __init__(self):
+                self.commits = []
+
+            def remote_head(self):
+                return "H0"
+
+            def verify_history(self, *_):
+                return None
+
+            def read_at(self, *_):
+                return None
+
+            def history_absent(self, *_):
+                return True
+
+            def publish(self, relative, data, head, message, raw=False):
+                self.commits.append((message, [relative], raw))
+                return "PUBLISHED", f"H{len(self.commits)}"
+
+            def publish_many(self, files, head, message):
+                self.commits.append((message, sorted(files), None))
+                return "PUBLISHED", f"H{len(self.commits)}"
+
+            def publish_terminal(self, *_):
+                self.commits.append(("terminal", [], None))
+                return "PUBLISHED", f"H{len(self.commits)}"
+
+        writer = CountingWriter()
+        now = datetime.now(timezone.utc)
+        slot = now.replace(minute=30 if now.minute >= 30 else 0, second=0, microsecond=0).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        env = {
+            "PIT_ACTIVATION_CANDIDATE_SLOT": slot, "PIT_AUTHORIZED_WRITER": p.AUTHORIZED_WRITER,
+            "PIT_H0": "H0", "PIT_I_IMPL": "A" * 64,
+            "PIT_IMAGE_DIGEST": "sha256:" + "b" * 64,
+            "CLOUD_RUN_EXECUTION": "pit-ledger-test", "CLOUD_RUN_JOB": "pit-ledger",
+        }
+
+        def acquire(_, claim, __, ___, durable, ____, _____):
+            root = p.slot_root(claim["value"]["formal_slot_utc"])
+            for ordinal in range(8):
+                durable(root + f"raw/S{ordinal}-0.bin", b"raw", True)
+                durable(root + f"source-manifests/S{ordinal}-0.json", p.canonical_bytes({"page": ordinal}), False)
+            return {"__outcome__": {"outcome_kind": "ABORTED_ATTEMPT", "reason_codes": ["ATTEMPT_ABORTED"]}}
+
+        with (
+            patch.dict(os.environ, env, clear=True),
+            patch.object(p, "require_live_authorization"),
+            patch.object(p, "GitWriter", return_value=writer),
+            patch.object(p, "prepare_live_slot", return_value="H0"),
+            patch.object(p, "acquire_fixture_sources", side_effect=acquire),
+            patch("sys.stdout", new_callable=io.StringIO),
+        ):
+            p.live_capture()
+        self.assertEqual(len(writer.commits), 11)
+        self.assertEqual(writer.commits[0][0], "PIT claim")
+        self.assertTrue(all(commit[2] for commit in writer.commits[1:9]))
+        self.assertEqual((writer.commits[9][0], len(writer.commits[9][1])), ("PIT evidence", 9))
+        self.assertEqual(writer.commits[10][0], "terminal")
 
     def test_bad_source_schema_is_total_and_never_qa_ok(self):
         writer, slot = "writer", "2026-07-26T20:00:00.000Z"
@@ -811,6 +887,10 @@ class PermissionAndStaticTests(unittest.TestCase):
                 venue["source_raw_sha256s"] = []
         with self.assertRaises(p.PitError):
             p.validate_snapshot(empty, claim, manifests, context, False, "A" * 64)
+        wrong_image = json.loads(json.dumps(snapshot))
+        wrong_image["image_digest"] = "sha256:" + "f" * 64
+        with self.assertRaisesRegex(p.PitError, "CLAIM_PROVENANCE"):
+            p.validate_snapshot(wrong_image, claim, manifests, context, False, "A" * 64)
 
     def test_existing_perp_missing_ticker_is_snapshot_partial(self):
         _, _, snapshot, _ = complete_snapshot_fixture(binance_case="missing_ticker")
@@ -1149,13 +1229,13 @@ class PermissionAndStaticTests(unittest.TestCase):
             )
         self.assertEqual(writer.recovered, [("2026-07-26T19:30:00.000Z", "A" * 64)])
 
-    def test_v7_container_and_branch_are_frozen(self):
+    def test_v8_container_and_branch_are_frozen(self):
         root = Path(__file__).parent
         docker = (root / "Dockerfile").read_text()
         self.assertFalse((root / ".github/workflows/pit-ledger.yml").exists())
-        self.assertEqual(p.CONTRACT_ID, "PIT_LEDGER_PUBLIC_ONLY_V7")
-        self.assertEqual(p.EPOCH_ID, "BASKET_PIT_LEDGER_TOP250_BINANCE_BYBIT_PUBLIC_V7")
-        self.assertEqual(p.GITHUB_BRANCH, "pit-ledger-public-v7")
+        self.assertEqual(p.CONTRACT_ID, "PIT_LEDGER_PUBLIC_ONLY_V8")
+        self.assertEqual(p.EPOCH_ID, "BASKET_PIT_LEDGER_TOP250_BINANCE_BYBIT_PUBLIC_V8")
+        self.assertEqual(p.GITHUB_BRANCH, "pit-ledger-public-v8")
         self.assertIn("FROM --platform=linux/amd64 python:3.12-slim-bookworm@sha256:8a7e7cc04fd3e2bd787f7f24e22d5d119aa590d429b50c95dfe12b3abe52f48b", docker)
         self.assertIn("COPY Dockerfile pit_ledger.py /app/", docker)
         self.assertIn('ENTRYPOINT ["python","/app/pit_ledger.py","cloud-run"]', docker)

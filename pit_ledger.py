@@ -24,12 +24,12 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Callable, Iterable
 
-CONTRACT_ID = "PIT_LEDGER_PUBLIC_ONLY_V7"
-EPOCH_ID = "BASKET_PIT_LEDGER_TOP250_BINANCE_BYBIT_PUBLIC_V7"
+CONTRACT_ID = "PIT_LEDGER_PUBLIC_ONLY_V8"
+EPOCH_ID = "BASKET_PIT_LEDGER_TOP250_BINANCE_BYBIT_PUBLIC_V8"
 PREFIX = f"pit_ledger/{EPOCH_ID}/"
 CONCURRENCY_GROUP = f"pit-ledger-{EPOCH_ID}"
 GITHUB_REPO = "git@github.com:Nool9/moneyfactory-public-data.git"
-GITHUB_BRANCH = "pit-ledger-public-v7"
+GITHUB_BRANCH = "pit-ledger-public-v8"
 AUTHORIZED_WRITER = "PIT Ledger Writer <pit-ledger@users.noreply.github.com>"
 SECRET_MOUNT = "/secrets/github/id_ed25519"
 KNOWN_HOSTS = "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl\n"
@@ -760,6 +760,7 @@ def build_snapshot(
         "formal_slot_utc": value["formal_slot_utc"],
         "idempotency_key": value["idempotency_key"],
         "materialized_at_utc": value["claimed_at_utc"],
+        "image_digest": value["image_digest"],
         "outcome_kind": kind,
         "qa": {"qa_status": "QA_OK" if not reason_codes else "QA_FAILURE", "reason_codes": reason_codes},
         "reason_codes": reason_codes,
@@ -793,6 +794,8 @@ def validate_snapshot(
         raise PitError("IMPLEMENTATION_MISMATCH")
     if expected_i_impl is not None and snapshot["I_impl"] != expected_i_impl:
         raise PitError("IMPLEMENTATION_MISMATCH")
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", snapshot.get("image_digest", "")):
+        raise PitError("IMAGE_PROVENANCE")
     slot = snapshot.get("formal_slot_utc")
     if snapshot.get("idempotency_key") != EPOCH_ID + "|" + str(slot):
         raise PitError("IDEMPOTENCY_MISMATCH")
@@ -950,6 +953,7 @@ def validate_snapshot(
         expected = {
             "I_impl": value["I_impl"], "formal_slot_utc": value["formal_slot_utc"],
             "idempotency_key": value["idempotency_key"], "attempt_id": value["attempt_id"],
+            "image_digest": value["image_digest"],
             "workflow_run_id": value["workflow_run_id"], "job_id": value["job_id"],
             "log_locator": value["log_locator"], "claim_relative_path": claim["relative_path"],
             "claim_sha256": sha256(canonical_bytes(value)),
@@ -1347,8 +1351,11 @@ def make_claim(
     workflow_run_id: str = "fixture-run",
     job_id: str = "fixture-job",
     log_locator: str | None = None,
+    image_digest: str = "sha256:" + "0" * 64,
 ) -> dict[str, Any]:
     validate_utc(slot)
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", image_digest):
+        raise PitError("IMAGE_PROVENANCE")
     key = EPOCH_ID + "|" + slot
     filesafe = claim_filesafe(slot)
     return {
@@ -1365,6 +1372,7 @@ def make_claim(
             "expected_parent_before_claim": parent,
             "formal_slot_utc": slot,
             "idempotency_key": key,
+            "image_digest": image_digest,
             "job_id": job_id,
             "log_locator": log_locator or artifact_path(slot_root(slot) + "run.log"),
             "workflow_run_id": workflow_run_id,
@@ -1375,11 +1383,12 @@ def make_claim(
 def run_log_bytes(claim: dict[str, Any]) -> bytes:
     value = claim["value"]
     return (
-        "PIT_LEDGER_PUBLIC_ONLY_V7\n"
+        "PIT_LEDGER_PUBLIC_ONLY_V8\n"
         f"idempotency_key={value['idempotency_key']}\n"
         f"attempt_id={value['attempt_id']}\n"
         f"workflow_run_id={value['workflow_run_id']}\n"
         f"job_id={value['job_id']}\n"
+        f"image_digest={value['image_digest']}\n"
     ).encode("utf-8")
 
 
@@ -1407,6 +1416,7 @@ def base_outcome(
         "epoch_id": EPOCH_ID,
         "formal_slot_utc": value["formal_slot_utc"],
         "idempotency_key": value["idempotency_key"],
+        "image_digest": value["image_digest"],
         "job_id": value["job_id"],
         "log_locator": value["log_locator"],
         "log_sha256": sha256(log_bytes if log_bytes is not None else run_log_bytes(claim)),
@@ -1890,31 +1900,56 @@ class GitWriter:
         return result.stdout if result.returncode == 0 else None
 
     def verify_history(self, h0: str, head: str) -> None:
-        self.git("fetch", "--quiet", "origin", f"refs/heads/{self.branch}")
+        self.git("fetch", "--quiet", "--filter=blob:none", "origin", f"refs/heads/{self.branch}")
         if self.git("merge-base", "--is-ancestor", h0, head, check=False).returncode:
             raise PitError("EPOCH_WRITER_STOP")
-        for line in self.git("rev-list", "--reverse", "--parents", f"{h0}..{head}").stdout.splitlines():
-            parts = line.split()
-            if len(parts) != 2:
+        raw = self.git(
+            "log", "--reverse", "--format=@@%H%x00%P%x00%an%x00%ae",
+            "--raw", "--no-abbrev", "--no-renames", f"{h0}..{head}",
+        ).stdout
+        changes: list[str] | None = None
+        index_changes: list[tuple[str, str, str]] = []
+        for line in raw.splitlines():
+            if line.startswith("@@"):
+                if changes == []:
+                    raise PitError("EPOCH_WRITER_STOP")
+                fields = line[2:].split("\0")
+                if len(fields) != 4 or len(fields[1].split()) != 1 or f"{fields[2]} <{fields[3]}>" != self.writer:
+                    raise PitError("EPOCH_WRITER_STOP")
+                changes = []
+            elif line.startswith(":"):
+                if changes is None or "\t" not in line:
+                    raise PitError("EPOCH_WRITER_STOP")
+                metadata, path = line.split("\t", 1)
+                fields = metadata.split()
+                if len(fields) != 5 or fields[4] not in {"A", "M"} or path in changes:
+                    raise PitError("EPOCH_WRITER_STOP")
+                status = fields[4]
+                if status != "A" and path != LEDGER_INDEX_PATH or artifact_path(path) != path:
+                    raise PitError("EPOCH_WRITER_STOP")
+                changes.append(path)
+                if path == LEDGER_INDEX_PATH:
+                    index_changes.append((fields[2], fields[3], status))
+        if changes == []:
+            raise PitError("EPOCH_WRITER_STOP")
+        index = self.read_at(head, LEDGER_INDEX_PATH)
+        if not index_changes:
+            if index is not None:
                 raise PitError("EPOCH_WRITER_STOP")
-            commit = parts[0]
-            parent = parts[1]
-            author = self.git("show", "-s", "--format=%an <%ae>", commit).stdout.strip()
-            changes = [line.split("\t", 1) for line in self.git("diff-tree", "--no-commit-id", "--name-status", "-r", commit).stdout.splitlines()]
-            paths = [parts[1] for parts in changes if len(parts) == 2]
-            allowed_change = all(
-                parts[0] == "A" or parts == ["M", LEDGER_INDEX_PATH]
-                for parts in changes
-            )
-            if author != self.writer or not paths or not allowed_change or any(artifact_path(path) != path for path in paths):
+            return
+        if index is None:
+            raise PitError("EPOCH_WRITER_STOP")
+        records = validate_ledger_index(index)
+        if len(records) != len(index_changes):
+            raise PitError("EPOCH_WRITER_STOP")
+        prefix = b""
+        previous = "0" * 40
+        for ordinal, (old, new, status) in enumerate(index_changes):
+            prefix += canonical_bytes(records[ordinal])
+            oid = hashlib.sha1(b"blob " + str(len(prefix)).encode("ascii") + b"\0" + prefix).hexdigest()
+            if status != ("A" if ordinal == 0 else "M") or old != previous or new != oid:
                 raise PitError("EPOCH_WRITER_STOP")
-            for status, path in changes:
-                if status == "M":
-                    old = self.read_at(parent, path)
-                    new = self.read_at(commit, path)
-                    if old is None or new is None or not new.startswith(old):
-                        raise PitError("EPOCH_WRITER_STOP")
-                    validate_ledger_index(new)
+            previous = new
 
     def history_absent(self, h0: str, head: str, relative: str) -> bool:
         artifact_path(relative)
@@ -2001,7 +2036,7 @@ class GitWriter:
             os.makedirs(os.path.dirname(target), exist_ok=True)
             with open(target, "wb") as handle:
                 handle.write(data)
-        self.git("add", "--", *sorted(files))
+        self.git("add", "--sparse", "--", *sorted(files))
         if self.git("diff", "--cached", "--name-only").stdout.splitlines() != sorted(files):
             raise PitError("SCOPE_CHANGE")
         self.git("commit", "--quiet", "-m", message)
@@ -2086,7 +2121,7 @@ class GitWriter:
         ):
             return "EPOCH_WRITER_STOP"
         if claim is not None and any(outcome.get(field) != claim.get(field) for field in (
-            "I_impl", "formal_slot_utc", "idempotency_key", "attempt_id",
+            "I_impl", "formal_slot_utc", "idempotency_key", "attempt_id", "image_digest",
             "workflow_run_id", "job_id", "log_locator",
         )):
             return "EPOCH_WRITER_STOP"
@@ -2201,7 +2236,8 @@ class GitWriter:
             "claim_relative_path": claim["relative_path"] if claim_exists else None,
             "claim_sha256": sha256(canonical_bytes(value)) if claim_exists else None,
             "contract_id": CONTRACT_ID, "epoch_id": EPOCH_ID, "formal_slot_utc": slot,
-            "idempotency_key": key, "job_id": value["job_id"], "log_locator": log_path,
+            "idempotency_key": key, "image_digest": value["image_digest"],
+            "job_id": value["job_id"], "log_locator": log_path,
             "log_sha256": sha256(log), "materialized_at_utc": value["claimed_at_utc"],
             "outcome_kind": kind, "previous_ledger_head": head,
             "reason_codes": ordered(reasons, REASON_CODE_ORDER), "slot_status": OUTCOME_STATUS[kind],
@@ -2211,7 +2247,8 @@ class GitWriter:
         if payload is not None:
             outcome = dict(payload)
             outcome.update(
-                previous_ledger_head=head, log_locator=log_path, log_sha256=sha256(log),
+                previous_ledger_head=head, image_digest=value["image_digest"],
+                log_locator=log_path, log_sha256=sha256(log),
                 source_manifest_sha256s=sorted({sha256(canonical_bytes(item)) for _, item in manifests}),
                 available_raw_count=len(raw_pairs),
                 available_raw_relative_paths=[item[0] for item in raw_pairs],
@@ -2321,6 +2358,7 @@ def prepare_live_slot(
     writer_id: str,
     workflow_run_id: str = "recovery-run",
     job_id: str = "capture",
+    image_digest: str = "sha256:" + "0" * 64,
 ) -> str:
     records = writer.ledger_records(writer.remote_head())
     overdue = add_slots(records[-1]["formal_slot_utc"]) if records else activation_slot
@@ -2328,7 +2366,7 @@ def prepare_live_slot(
         recovery_claim = make_claim(
             overdue, i_impl, writer_id, writer.remote_head(),
             now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z",
-            workflow_run_id, job_id,
+            workflow_run_id, job_id, image_digest=image_digest,
         )
         status, _ = writer.recover_slot(h0, recovery_claim, now, i_impl)
         if status not in {"PUBLISHED", "DUPLICATE_NO_WRITE"}:
@@ -2356,7 +2394,7 @@ def live_capture() -> None:
     head = prepare_live_slot(
         writer, env["PIT_H0"], env["PIT_ACTIVATION_CANDIDATE_SLOT"], slot, now,
         env["PIT_I_IMPL"], writer_id, env["CLOUD_RUN_EXECUTION"],
-        env["CLOUD_RUN_JOB"],
+        env["CLOUD_RUN_JOB"], env["PIT_IMAGE_DIGEST"],
     )
     key = EPOCH_ID + "|" + slot
     outcome_path = artifact_path(PREFIX + "outcomes/" + claim_filesafe(slot) + ".json")
@@ -2366,7 +2404,7 @@ def live_capture() -> None:
     claim = make_claim(
         slot, env["PIT_I_IMPL"], writer_id, head,
         now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z",
-        env["CLOUD_RUN_EXECUTION"], env["CLOUD_RUN_JOB"],
+        env["CLOUD_RUN_EXECUTION"], env["CLOUD_RUN_JOB"], image_digest=env["PIT_IMAGE_DIGEST"],
     )
     key, claim_path = claim["value"]["idempotency_key"], claim["relative_path"]
     if not writer.history_absent(env["PIT_H0"], head, claim_path):
@@ -2381,9 +2419,13 @@ def live_capture() -> None:
     ledger = Ledger(writer_id, head=head)
     ledger.claims[key] = claim
     ledger.history_claim_keys.add(key)
+    pending_evidence: dict[str, tuple[bytes, bool]] = {}
 
     def durable(relative: str, data: bytes, raw: bool) -> None:
         nonlocal head
+        if not raw:
+            pending_evidence[relative] = (data, False)
+            return
         status, new_head = writer.publish(relative, data, head, "PIT artifact", raw)
         if status != "PUBLISHED":
             raise PitError(writer.verify_duplicate(key, head, new_head, env["PIT_H0"], env["PIT_I_IMPL"]))
@@ -2394,6 +2436,11 @@ def live_capture() -> None:
         _live_send,
         lambda: datetime.now(timezone.utc), durable, time.sleep, False,
     )
+    log_path = claim["value"]["log_locator"]
+    pending_evidence[log_path] = (run_log_bytes(claim), True)
+    status, head = writer.publish_many(pending_evidence, head, "PIT evidence")
+    if status != "PUBLISHED":
+        raise PitError(writer.verify_duplicate(key, None, head, env["PIT_H0"], env["PIT_I_IMPL"]))
     if "__outcome__" in parsed:
         outcome = parsed["__outcome__"]
     else:
@@ -2458,14 +2505,17 @@ def cloud_run() -> int:
             child_env = dict(env, GIT_SSH_COMMAND=ssh_command)
             stage = "STOP_PERMISSION_REQUIRED_CLONE"
             checked(
-                "git", "clone", "--quiet", "--branch", GITHUB_BRANCH,
-                "--single-branch", GITHUB_REPO, clone_path, run_env=child_env,
+                "git", "clone", "--quiet", "--filter=blob:none", "--sparse",
+                "--branch", GITHUB_BRANCH, "--single-branch", GITHUB_REPO,
+                clone_path, run_env=child_env,
             )
             stage = "STOP_PERMISSION_REQUIRED_BINDING"
             checked("git", "merge-base", "--is-ancestor", env["PIT_H0"], "HEAD", cwd=clone_path)
             if (
                 checked("git", "branch", "--show-current", cwd=clone_path) != GITHUB_BRANCH
                 or checked("git", "remote", "get-url", "origin", cwd=clone_path) != GITHUB_REPO
+                or checked("git", "config", "--get", "remote.origin.partialclonefilter", cwd=clone_path) != "blob:none"
+                or os.path.exists(os.path.join(clone_path, "pit_ledger"))
                 or current_i_impl(clone_path) != env["PIT_I_IMPL"]
             ):
                 raise PitError(stage)
@@ -2484,6 +2534,16 @@ def cloud_run() -> int:
                 cwd=clone_path, env=child_env, capture_output=True, text=True, check=False,
             )
             if result.returncode:
+                detail = result.stderr.strip()
+                controlled = re.fullmatch(r"PIT_ERROR:([A-Z][A-Z0-9_]{2,127})", detail)
+                if controlled:
+                    print(controlled.group(1), file=sys.stderr)
+                elif result.stderr:
+                    print(
+                        f"CAPTURE_CHILD_STDERR_SHA256={sha256(result.stderr.encode())} "
+                        f"BYTES={len(result.stderr.encode())}",
+                        file=sys.stderr,
+                    )
                 raise PitError(stage)
             return 0
     except Exception:
@@ -2710,6 +2770,20 @@ def e2e_self_check() -> None:
         assert a.verify_duplicate(
             bad_claim["value"]["idempotency_key"], resumed_head, bad_head, h0, "A" * 64
         ) == "EPOCH_WRITER_STOP"
+        tampered_records = a.ledger_records(bad_head)
+        tampered_records[0]["outcome_sha256"] = "C" * 64
+        status, tampered_head = a.publish_many(
+            {LEDGER_INDEX_PATH: (canonical_jsonl(tampered_records), True)},
+            bad_head, "tampered historical prefix fixture",
+        )
+        assert status == "PUBLISHED"
+        try:
+            a.verify_history(h0, tampered_head)
+        except PitError as exc:
+            assert str(exc) == "EPOCH_WRITER_STOP"
+        else:
+            raise AssertionError("tampered index prefix accepted")
+        run(remote, "update-ref", f"refs/heads/{GITHUB_BRANCH}", bad_head, tampered_head)
         wrong = GitWriter(clones[2], writer_identity)
         wrong_claim = make_claim(add_slots(bad_slot), "A" * 64, writer_identity, bad_head)
         try:
@@ -2741,5 +2815,6 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main(sys.argv[1:]))
     except PitError as exc:
-        print(str(exc), file=sys.stderr)
+        prefix = "PIT_ERROR:" if sys.argv[1:] == ["capture"] else ""
+        print(prefix + str(exc), file=sys.stderr)
         raise SystemExit(1)
