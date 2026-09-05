@@ -1,0 +1,6 @@
+PIT_LEDGER_PUBLIC_ONLY_V8
+idempotency_key=BASKET_PIT_LEDGER_TOP250_BINANCE_BYBIT_PUBLIC_V8|2026-09-05T17:30:00.000Z
+attempt_id=B917387AF3E06FA0EB55B0835D4E3D84
+workflow_run_id=pit-ledger-x44gv
+job_id=pit-ledger
+image_digest=sha256:9fab18251cbad3fe39e124ef5f6c2b7d73b20dc4335d0fde47af0c682f51c3ae
