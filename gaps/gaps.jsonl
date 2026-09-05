@@ -2551,3 +2551,4 @@
 {"error":"HTTP Error 403: Forbidden","gap_id":"877e6cd00d8432d2","kind":"source_gap","slot":"2026-09-05T09:30:00Z","source":"announcements_bybit","url":"https://api.bybit.com/v5/announcements/index?locale=en-US&type=new_crypto&limit=20"}
 {"error":"HTTP Error 403: Forbidden","gap_id":"080c5b75cca1350b","kind":"source_gap","slot":"2026-09-05T10:00:00Z","source":"announcements_bybit","url":"https://api.bybit.com/v5/announcements/index?locale=en-US&type=new_crypto&limit=20"}
 {"error":"HTTP Error 403: Forbidden","gap_id":"b13769f41d6c76ac","kind":"source_gap","slot":"2026-09-05T10:30:00Z","source":"announcements_bybit","url":"https://api.bybit.com/v5/announcements/index?locale=en-US&type=new_crypto&limit=20"}
+{"error":"HTTP Error 403: Forbidden","gap_id":"114b5e2316246ae7","kind":"source_gap","slot":"2026-09-05T11:00:00Z","source":"announcements_bybit","url":"https://api.bybit.com/v5/announcements/index?locale=en-US&type=new_crypto&limit=20"}
