@@ -1,6 +1,8 @@
-# PIT ledger public-only v8
+# PIT ledger public-only v9
 
-Pinned Cloud Run implementation for the PIT ledger public-only v8 contract.
+Candidate Cloud Run implementation for the PIT ledger public-only v9 contract.
+It accepts zero-sided raw Binance bookTicker rows while preserving positive
+quotes for any active perpetual candidate. V8 history remains immutable.
 
 Checks:
 
@@ -11,7 +13,7 @@ python pit_ledger.py e2e-self-check
 git diff --check
 ```
 
-The container bloblessly and sparsely clones only `pit-ledger-public-v8` and fails closed
+The container bloblessly and sparsely clones only `pit-ledger-public-v9` and fails closed
 before market access unless every separately governed activation, target-write,
 writer, implementation, image, credential and epoch boundary is present.
 Each slot has an immutable namespace, real log/slot manifest, checkpoint and

@@ -61,14 +61,18 @@ def complete_snapshot_fixture(bybit_page_count=1, binance_case=None, failed_sour
     }
     if bybit_borrowable_body is not None:
         bodies["BY_MARGIN_BORROWABLE"] = bybit_borrowable_body
-    if binance_case in {"missing_ticker", "public_perp"}:
+    if binance_case in {"missing_ticker", "public_perp", "zero_ticker"}:
         bodies["BN_FUT_EXCHANGE_INFO"] = json.dumps(
             {"symbols": [binance_instrument("X0")]}, separators=(",", ":")
         ).encode()
-    if binance_case == "public_perp":
+    if binance_case in {"public_perp", "zero_ticker"}:
         bodies.update(
             BN_FUT_PREMIUM_INDEX=b'[{"indexPrice":"100","lastFundingRate":"0.001","markPrice":"100","symbol":"X0USDT","time":1720000000123}]',
-            BN_FUT_BOOK_TICKER=b'[{"askPrice":"100","bidPrice":"99","symbol":"X0USDT"}]',
+            BN_FUT_BOOK_TICKER=(
+                b'[{"askPrice":"100","bidPrice":"0","symbol":"X0USDT"}]'
+                if binance_case == "zero_ticker" else
+                b'[{"askPrice":"100","bidPrice":"99","symbol":"X0USDT"}]'
+            ),
         )
     bybit_pages = [
         b'{"result":{"list":[],"nextPageCursor":"next"}}',
@@ -336,16 +340,20 @@ class UniverseAndMappingTests(unittest.TestCase):
     def test_binance_inactive_book_ticker_is_source_only(self):
         valid = [
             {"symbol": "BTCUSDT", "bidPrice": "99", "askPrice": "100"},
-            {"symbol": "BTCUSDT_260626", "bidPrice": "0.0", "askPrice": "0.0"},
+            {"symbol": "BTCUSDT_260925", "bidPrice": "0.0", "askPrice": "89550.0"},
+            {"symbol": "ETHUSDT_260925", "bidPrice": "0.00", "askPrice": "0.00"},
         ]
         p.validate_source_schema("BN_FUT_BOOK_TICKER", valid)
-        for bid, ask in (("0", "1"), ("1", "0"), ("-1", "1"), ("2", "1")):
+        for bid, ask in (("-1", "1"), ("1", "-1"), ("2", "1")):
             with self.subTest(bid=bid, ask=ask):
                 with self.assertRaises(p.PitError):
                     p.validate_source_schema("BN_FUT_BOOK_TICKER", [{"symbol": "BTCUSDT", "bidPrice": bid, "askPrice": ask}])
         premium = [{"symbol": "BTCUSDT", "lastFundingRate": "0.001", "markPrice": "100", "indexPrice": "100", "time": 1720000000123}]
-        with self.assertRaises(p.PitError):
-            p._ticker_record("BINANCE_USDM", "BTCUSDT", premium, [{"symbol": "BTCUSDT", "bidPrice": "0", "askPrice": "0"}], None)
+        for bid, ask in (("0", "1"), ("1", "0"), ("0", "0")):
+            book = [{"symbol": "BTCUSDT", "bidPrice": bid, "askPrice": ask}]
+            p.validate_source_schema("BN_FUT_BOOK_TICKER", book)
+            with self.assertRaises(p.PitError):
+                p._ticker_record("BINANCE_USDM", "BTCUSDT", premium, book, None)
 
     def test_bybit_empty_funding_is_source_only(self):
         row = {"symbol": "BTCUSDT", "fundingRate": "", "bid1Price": "99", "ask1Price": "100", "markPrice": "100", "indexPrice": "100"}
@@ -911,6 +919,16 @@ class PermissionAndStaticTests(unittest.TestCase):
         with self.assertRaises(p.PitError):
             p.validate_snapshot(inconsistent)
 
+    def test_existing_perp_zero_ticker_is_snapshot_partial(self):
+        _, _, snapshot, _ = complete_snapshot_fixture(binance_case="zero_ticker")
+        row = snapshot["assets"][0]["venues"][0]
+        self.assertIs(row["perp_exists"], True)
+        self.assertIsNone(row["bid_price"])
+        self.assertIsNone(row["ask_price"])
+        self.assertEqual(row["missing_reasons"], ["NOT_OBSERVED_PUBLIC_ONLY", "SCHEMA_FAILURE"])
+        self.assertEqual(snapshot["outcome_kind"], "SNAPSHOT_PARTIAL")
+        self.assertEqual(snapshot["qa"]["qa_status"], "QA_FAILURE")
+
     def test_existing_perp_public_only_borrow_is_not_an_error(self):
         claim, manifests, snapshot, context = complete_snapshot_fixture(binance_case="public_perp")
         row = snapshot["assets"][0]["venues"][0]
@@ -1229,13 +1247,13 @@ class PermissionAndStaticTests(unittest.TestCase):
             )
         self.assertEqual(writer.recovered, [("2026-07-26T19:30:00.000Z", "A" * 64)])
 
-    def test_v8_container_and_branch_are_frozen(self):
+    def test_v9_container_and_branch_are_frozen(self):
         root = Path(__file__).parent
         docker = (root / "Dockerfile").read_text()
         self.assertFalse((root / ".github/workflows/pit-ledger.yml").exists())
-        self.assertEqual(p.CONTRACT_ID, "PIT_LEDGER_PUBLIC_ONLY_V8")
-        self.assertEqual(p.EPOCH_ID, "BASKET_PIT_LEDGER_TOP250_BINANCE_BYBIT_PUBLIC_V8")
-        self.assertEqual(p.GITHUB_BRANCH, "pit-ledger-public-v8")
+        self.assertEqual(p.CONTRACT_ID, "PIT_LEDGER_PUBLIC_ONLY_V9")
+        self.assertEqual(p.EPOCH_ID, "BASKET_PIT_LEDGER_TOP250_BINANCE_BYBIT_PUBLIC_V9")
+        self.assertEqual(p.GITHUB_BRANCH, "pit-ledger-public-v9")
         self.assertIn("FROM --platform=linux/amd64 python:3.12-slim-bookworm@sha256:8a7e7cc04fd3e2bd787f7f24e22d5d119aa590d429b50c95dfe12b3abe52f48b", docker)
         self.assertIn("COPY Dockerfile pit_ledger.py /app/", docker)
         self.assertIn('ENTRYPOINT ["python","/app/pit_ledger.py","cloud-run"]', docker)

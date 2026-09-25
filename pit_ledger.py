@@ -24,12 +24,12 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Callable, Iterable
 
-CONTRACT_ID = "PIT_LEDGER_PUBLIC_ONLY_V8"
-EPOCH_ID = "BASKET_PIT_LEDGER_TOP250_BINANCE_BYBIT_PUBLIC_V8"
+CONTRACT_ID = "PIT_LEDGER_PUBLIC_ONLY_V9"
+EPOCH_ID = "BASKET_PIT_LEDGER_TOP250_BINANCE_BYBIT_PUBLIC_V9"
 PREFIX = f"pit_ledger/{EPOCH_ID}/"
 CONCURRENCY_GROUP = f"pit-ledger-{EPOCH_ID}"
 GITHUB_REPO = "git@github.com:Nool9/moneyfactory-public-data.git"
-GITHUB_BRANCH = "pit-ledger-public-v8"
+GITHUB_BRANCH = "pit-ledger-public-v9"
 AUTHORIZED_WRITER = "PIT Ledger Writer <pit-ledger@users.noreply.github.com>"
 SECRET_MOUNT = "/secrets/github/id_ed25519"
 KNOWN_HOSTS = "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl\n"
@@ -1276,7 +1276,7 @@ def validate_source_schema(source_id: str, body: Any) -> None:
         for row in rows:
             bid = parse_decimal_string(row["bidPrice"])
             ask = parse_decimal_string(row["askPrice"])
-            if (bid != 0 or ask != 0) and (bid <= 0 or ask <= 0 or bid > ask):
+            if bid < 0 or ask < 0 or (bid > 0 and ask > 0 and bid > ask):
                 raise PitError("SCHEMA_FAILURE")
     elif source_id == "BY_LINEAR_TICKERS":
         for row in rows:
@@ -1383,7 +1383,7 @@ def make_claim(
 def run_log_bytes(claim: dict[str, Any]) -> bytes:
     value = claim["value"]
     return (
-        "PIT_LEDGER_PUBLIC_ONLY_V8\n"
+        f"{CONTRACT_ID}\n"
         f"idempotency_key={value['idempotency_key']}\n"
         f"attempt_id={value['attempt_id']}\n"
         f"workflow_run_id={value['workflow_run_id']}\n"
